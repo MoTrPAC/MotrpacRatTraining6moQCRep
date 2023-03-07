@@ -1,0 +1,1609 @@
+---
+title: "PASS1B QC and Analysis report: Proteomics"
+author: "David Amar (Stanford), Pierre Jean Beltran (Broad), James Sanford (PNNL), David Jimenez-Morales (Stanford)"
+date: "2021/09/14"
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    fig_crop: FALSE
+geometry: margin=2cm
+---
+
+```{r setup, include=FALSE}
+# Install packages
+cran_packages <- c("BiocManager", 
+                   "caret", 
+                   "data.table", 
+                   "devtools",
+                   "ggcorrplot",
+                   "kableExtra", 
+                   "knitr", 
+                   "missForest",
+                   "stats", 
+                   "tidyverse")
+for(c in cran_packages){
+  if (!requireNamespace(c, quietly = TRUE)){
+    message("\n+ Installing BiocC required library <", c,">\n")
+    install.packages(c, dependencies = TRUE, )
+  }
+}
+
+# Tricky: install manually
+# devtools::install_github("ricoderks/Rcpm", dependencies = TRUE)
+
+bioc_packages <- c("affy", 
+                   "apeglm",
+                   "DESeq2",
+                   "edgeR", 
+                   "impute", 
+                   "limma", 
+                   "metap", 
+                   "multtest", 
+                   "NOISeq", 
+                   "org.Rn.eg.db", 
+                   "preprocessCore",
+                   "sva")
+for(p in bioc_packages){
+  if (!requireNamespace(p, quietly = TRUE)){
+    message("\n+ Installing BiocC required library <", p,">\n")
+    BiocManager::install(p, dependencies = TRUE)
+  }
+}
+
+# configuration of the session: load libraries and functions
+session_packages <- c(cran_packages, bioc_packages)
+for (lib_name in session_packages){
+  tryCatch({library(lib_name, character.only = TRUE)}, error = function(e) {
+    print(paste("Cannot load", lib_name, ", please install"))
+  })
+}
+
+knitr::opts_chunk$set(echo = TRUE)
+# knitr::opts_chunk$set(dev = 'jpeg') # helps in reducing the pdf size
+```
+
+
+
+In this document we analyze the PASS1B proteomics animal data of MoTrPAC. The flow steps are: (1) load the data from the google cloud bucket, (2) preprocess each dataset, (3) PCA analysis and correlation with metadata variables, and (4) flagging potential outliers, (5) removing outliers as revised by the proteomics groups, (6) perform differential abundance analysis.
+
+
+
+```{r}
+# CONFIGURATIONS
+# Specify the parameters required for the analysis
+# This dir should have the motrpac-bic-norm-qc repo
+# repo_local_dir = "~/Projects/"
+repo_local_dir = "~/github/MoTrPAC/"
+
+# Runnable command for gsutil
+# gsutil_cmd = "gsutil"
+gsutil_cmd = "~/bin/google-cloud-sdk/bin/gsutil"
+
+# Bucket structure is: tissue/platform/results/<data files>. For GET, this path should
+# also have a qa_qc directory with the qc_metrics and sample_metadata files.
+#bucket = "gs://motrpac-release-data-staging/Results/pass1b-06/proteomics/"
+bucket = "gs://motrpac-processed-mass_spectrometry/DF_PASS_20210731/pass1b-06/proteomics/"
+
+# Where should the data be downloaded to
+# local_data_dir = "C:/Users/pmj72/Projects/temp/motrpac-pass/motrpac-bic-pass1b-freeze/"
+download_from_bucket = FALSE # If FALSE, it assumes the data is there
+local_data_dir = "~/github/MoTrPAC/motrpac-bic-norm-qc/data/proteomics/DF_PASS_20210731"
+
+# where to print the data and dea tables
+upload_to_bucket = FALSE # TRUE upload the data to the bucket
+out_bucket = "gs://mawg-data/pass1b-06/"
+dea_folder_name = "dea"
+suffix = "20210914.txt"
+
+
+# Specify bucket and local path for the phenotypic data
+# this path is internal to BIC - faster
+pheno_bucket = "gs://mawg-data/pass1b-06/pheno_dmaqc/merged2021-09-09/"
+# pheno_local_dir = "C:/Users/pmj72/Projects/temp/motrpac-pass/motrpac-bic-pass1b-freeze/dmaqc_pheno/"
+pheno_local_dir = "~/github/MoTrPAC/motrpac-bic-norm-qc/data/proteomics/pheno_dmaqc/"
+
+# specify parameters for filtering by missing values
+max_na_freq = 0.67
+# Should PCA use imputed data?
+pca_using_impute=FALSE
+
+# Specify how many PCs to examine
+num_pcs = 5
+num_pcs_for_outlier_analysis = 3
+# Specify the significance level for association analysis
+# (e.g., between a PC and a clinical variable)
+p_thr = 0.0001
+```
+
+Specify the pipeline, metadata, and sample variables for the analysis. 
+
+```{r,eval=TRUE}
+# Define technical and biological variables to be considered in the QC
+pipeline_qc_cols = c("tmt_plex","num_NA")
+biospec_cols = c("registration.sex",
+                 "key.anirandgroup",
+                 "registration.batchnumber",
+                 "training.staffid",
+                 "is_control",
+                 "vo2.max.test.vo2_max_visit1", # this assumes that visit1's are aligned
+                 "terminal.weight.mg",
+                 "time_to_freeze",
+                 "timepoint",
+                 "bid",
+                 "pid")
+```
+
+
+```{r, warning=FALSE,results=FALSE,message=FALSE}
+# load functions and libraries
+source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/unsupervised_normalization_functions.R"))
+source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/gcp_functions.R"))
+source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/qc_report_aux_functions.R"))
+source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/config_session.R"))
+source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/association_analysis_methods.R"))
+source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/ptm_protein_correction.R"))
+```
+
+# 1. Load data
+
+# 1.1 Download data
+
+```{r,eval=FALSE}
+if(download_from_bucket){
+  obj = download_bucket_to_local_dir(bucket,
+                                     local_path=path.expand(local_data_dir),
+                                     remove_prev_files = TRUE,
+                                     GSUTIL_PATH=gsutil_cmd)
+}
+```
+
+# 1.2 Parse proteomics results
+
+The code belows take the metadata and ration tables. For raw intensities (rii) - specify the matrix regex in "parse_proteomics_datasets_from_download_obj".
+
+```{r,message=FALSE,warning=FALSE}
+obj = list(
+  downloaded_files = list.files(local_data_dir,full.names = TRUE,recursive = TRUE),
+  local_path = local_data_dir
+)
+
+proteomics_data = parse_proteomics_datasets_from_download_obj(
+  obj,local_path=local_data_dir,remove_prev_files = TRUE,GSUTIL_PATH=gsutil_cmd,
+  platforms = c("prot-ph","prot-pr","prot-ac", "prot-ub")
+)
+failed_datasets = proteomics_data$failed_datasets
+proteomics_data = proteomics_data$proteomics_parsed_datasets
+
+#this is commented out: the printed buckets here will refer to the "ac" datasets,
+# and these were not submitted for this release.
+if(length(failed_datasets)>1){
+  print("Assays/data not available (or failed):")
+  local_fname = file.path(local_data_dir, paste0("log-pass1b-06_datasets-not-processed_",suffix))
+  write.table(failed_datasets, local_fname, row.names = FALSE,quote=FALSE,sep="\t",col.names = FALSE)
+}
+```
+
+# 1.3 Download and parse phenotypic data
+
+```{r,message=FALSE,warning=FALSE}
+# Add the pheno data
+pheno_data = parse_pheno_data(pheno_bucket,
+                              local_path = path.expand(pheno_local_dir),
+                              remove_prev_files = TRUE,
+                              GSUTIL_PATH=gsutil_cmd)
+# add a tissue variable (for convinience)
+pheno_data$viallabel_data$tissue = 
+  pheno_data$viallabel_data$specimen.processing.sampletypedescription
+# add the time to freeze variable ((for convinience))
+pheno_data$viallabel_data$time_to_freeze = 
+  pheno_data$viallabel_data$calculated.variables.frozetime_after_train - 
+  pheno_data$viallabel_data$calculated.variables.deathtime_after_train
+
+# some freeze times are negative because the tissues were taken
+# before sacrifice time, zero these cases
+pheno_data$viallabel_data$time_to_freeze = pmax(0,pheno_data$viallabel_data$time_to_freeze)
+
+# add a binary is_control variable
+pheno_data$viallabel_data$is_control = as.numeric(grepl("control",
+  pheno_data$viallabel_data$key.anirandgroup,ignore.case = T))
+# add the timepoint as a number
+# x - the text description of the group
+get_numeric_timepoint<-function(x){
+  v = rep(0,length(x))
+  tps = c("Eight"=8,"Four"=4,"One"=1,"Two"=2)
+  for(tp in names(tps)){
+    v[grepl(paste0(tp,"-week"),x,perl = T,ignore.case = T)] = tps[tp]
+  }
+  return(v)
+}
+pheno_data$viallabel_data$timepoint = get_numeric_timepoint(
+  pheno_data$viallabel_data$key.anirandgroup
+)
+```
+
+# 2 Normalization and processing
+
+## 2.1 Normalize and filter the data 
+
+- Median mad normalization
+- Remove batch effect
+- Impute (for PCA)
+
+Note: We use limma's `removeBatchEffect` to account for plex variation. We also keep a version of the data with imputed missing values. The new data objects are saved into the proteomics_data list.
+
+```{r,eval = TRUE,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,results=FALSE}
+for(dataset_name in names(proteomics_data)){
+  print(paste("processing",dataset_name))
+  curr_data  = proteomics_data[[dataset_name]]$sample_data
+  # median value normalization
+  sample_meta = proteomics_data[[dataset_name]]$sample_meta[colnames(curr_data),]
+  
+  # Exclude features with many NAs
+  row_NA_data = rowSums(is.na(curr_data))/ncol(curr_data)
+  feature_inds = row_NA_data < max_na_freq
+  # filter and normalize
+  norm_data = as.matrix(curr_data[feature_inds,])
+  norm_data = run_median_mad_norm(norm_data)
+  # b for batch corrected
+  norm_data_b = limma::removeBatchEffect(norm_data,sample_meta$tmt_plex)
+  
+  # Impute - use capture.output to avoid prints 
+  # This will be used for PCA
+  capture.output({
+    norm_data_b_imp = impute::impute.knn(as.matrix(norm_data_b))$data
+    norm_data_imp = impute::impute.knn(as.matrix(norm_data))$data
+  },file=NULL)
+  
+  # Median normalization (per MOP)
+  # norm_data_imp = run_median_mad_norm(norm_data_imp)
+  if(any(is.na(norm_data_imp))){
+    print(paste("Imputation failed in:",dataset_name))
+  }
+  
+  proteomics_data[[dataset_name]][["norm_filtered"]] = list(
+    norm_data_b = norm_data_b, # normalized and batch corrected
+    norm_data_b_imp = norm_data_b_imp, # normalizes, batch corrected and imputed
+    norm_data = norm_data, # normalized only, no batch correction, no imputation
+    norm_data_imp = norm_data_imp, # normalized with imputation, no batch correction
+    feature_inds = feature_inds
+  )
+  print(paste0('done, objects saved into proteomics_data[["',
+               dataset_name,'"]][[,norm_filtered]]'))
+}
+```
+
+## 2.2 Examine normalization effects
+
+Examine the effect of the normalization process, which includes removing features with many NAs. For each dataset show the boxplots of three randomly selected plexes.
+
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=FALSE}
+for(i in 1:length(proteomics_data)){
+  unnorm_data = proteomics_data[[i]]$sample_data
+  norm_data = proteomics_data[[i]][["norm_filtered"]][[1]]
+  plex = proteomics_data[[i]]$sample_meta[colnames(norm_data),"tmt_plex"]
+  plex = as.factor(plex)
+  # order the data by the plexes
+  ord = order(plex)
+  unnorm_data = unnorm_data[,ord]
+  norm_data = norm_data[,ord]
+  plex = plex[ord]
+  # take a subset of the plexes
+  samp_plex = sample(unique(plex))[1:3]
+  samp = which(plex %in% samp_plex)
+  # plot
+  curr_name = names(proteomics_data)[i]
+  colnames(unnorm_data) = NULL;colnames(norm_data) = NULL
+  boxplot(unnorm_data[,samp],
+          main=paste0(curr_name,"\nraw data (",nrow(unnorm_data)," features)"),
+          ylab = "log2 ratio",xaxt="n",col=plex)
+  boxplot(norm_data[,samp],
+          main=paste0(curr_name,"\nnorm data (ratios) (",nrow(norm_data)," features)"),
+          ylab = "log2 ratio",xaxt="n",col=plex)
+}
+```
+
+## 2.3 PTM Protein-abundance correction
+
+Correct PTM datasets with protein abundances. Most relevant for ubiquitylome data. 
+
+```{r}
+for(ptm_assay in c("prot-ub","prot-ac","prot-ph")){
+  
+  #Select the PTM assay that has to be corrected
+  ptm_data_names <- grep(ptm_assay,names(proteomics_data),value = T)
+  tissues <- str_extract(ptm_data_names,"(\\w|-)+")
+  
+  #Loop through all tissues in this PTM assay and perform protein correction
+  #Protein corrected dataset is saved under norm_filtered$norm_data_b_protein_corrected
+  for(tissue in tissues){
+    ptm_name <- paste(tissue,ptm_assay,sep=",")
+    prot_name <- paste(tissue,"prot-pr",sep=",")
+    cat("Protein correction - Processing dataset",paste(tissue,ptm_assay,sep=","),"...")
+    
+    #Identify matching protein id and save to row_annot in the PTM dataset
+    proteomics_data[[ptm_name]]$row_annot <- 
+      ptm_protein_match(pr_data = proteomics_data[[prot_name]]$norm_filtered$norm_data_b, 
+                        ptm_row_annot =  proteomics_data[[ptm_name]]$row_annot, 
+                        prot_row_annot = proteomics_data[[prot_name]]$row_annot)
+    
+    #Perform protein correction of PTM data
+    proteomics_data[[ptm_name]]$norm_filtered$norm_data_b_protein_corrected <-
+      ptm_protein_correction(ptm_data = proteomics_data[[ptm_name]]$norm_filtered$norm_data_b, 
+                             pr_data = proteomics_data[[prot_name]]$norm_filtered$norm_data_b, 
+                             ptm_row_annot =  proteomics_data[[ptm_name]]$row_annot, 
+                             prot_row_annot = proteomics_data[[prot_name]]$row_annot, 
+                             plot_graphs = T)
+    
+    #Remove sites with many missing values as indicated by feature_inds
+    proteomics_data[[ptm_name]]$norm_filtered$norm_data_b_protein_corrected <-
+      proteomics_data[[ptm_name]]$norm_filtered$norm_data_b_protein_corrected[
+        proteomics_data[[ptm_name]]$norm_filtered$feature_inds,]
+  }
+  
+}
+```
+
+
+
+# 3. Quality control
+
+## 3.1 PCA before and after adjusting for batch
+
+Run PCA analysis on the imputed data, with and without mitigating batch effects:
+
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=TRUE}
+for(dataset_name in names(proteomics_data)){
+  data_obj = proteomics_data[[dataset_name]]
+  data_samples = colnames(data_obj[["norm_filtered"]][["norm_data_b"]])
+  randgroup = pheno_data$viallabel_data[data_samples,"key.anirandgroup"]
+  sex = pheno_data$viallabel_data[data_samples,"registration.sex"]
+  sex[sex=="1"] = "F";sex[sex=="2"]="M"
+  plex = data_obj$sample_meta[data_samples,"tmt_plex"]
+  
+  # pca after removing batch effects
+  if(pca_using_impute){
+    curr_data = data_obj[["norm_filtered"]][["norm_data_b_imp"]]
+  }
+  else{
+    curr_data = data_obj[["norm_filtered"]][["norm_data_b"]]
+    curr_data = curr_data[rowSums(is.na(curr_data))==0,]
+  }
+  curr_pca = prcomp(t(curr_data),scale. = T,center = T)
+  curr_pcax = curr_pca$x[,1:num_pcs]
+  explained_var = summary(curr_pca)[["importance"]][3,5]
+  df = data.frame(curr_pcax,sex=sex,plex=plex,randgroup = randgroup)
+  proteomics_data[[dataset_name]][["norm_filtered"]][["pca_b"]] = list(
+    pcax = df,explained_var=explained_var
+  )
+  
+  # pca without removing batch effects
+  if(pca_using_impute){
+    curr_data = data_obj[["norm_filtered"]][["norm_data_imp"]]
+  }
+  else{
+    curr_data = data_obj[["norm_filtered"]][["norm_data"]]
+    curr_data = curr_data[rowSums(is.na(curr_data))==0,]
+  }
+  curr_pca = prcomp(t(curr_data),scale. = T,center = T)
+  curr_pcax = curr_pca$x[,1:num_pcs]
+  explained_var = summary(curr_pca)[["importance"]][3,5]
+  df = data.frame(curr_pcax,sex=sex,plex=plex,randgroup = randgroup)
+  proteomics_data[[dataset_name]][["norm_filtered"]][["pca_w_b"]] = list(
+    pcax = df,explained_var=explained_var
+  )
+}
+```
+
+PCA plots:
+
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=TRUE}
+for(dataset_name in names(proteomics_data)){
+  df = proteomics_data[[dataset_name]][["norm_filtered"]][["pca_w_b"]]$pcax
+  p = ggplot(df) + 
+      geom_point(aes(x=PC1, y=PC2,col=plex, shape=sex)) +
+      ggtitle(paste(dataset_name,"before batch effects analysis",sep=": "))
+  plot(p)
+  df = proteomics_data[[dataset_name]][["norm_filtered"]][["pca_b"]]$pcax
+  p = ggplot(df) + 
+      geom_point(aes(x=PC1, y=PC2,col=plex, shape=sex)) +
+      ggtitle(paste(dataset_name,"after batch effects analysis",sep=": "))
+  plot(p)
+}
+```
+
+## 3.2 PCA visualization of sex and group
+
+We plot the top two PCs for each tissue, color and shape correspond to randomization group and sex.
+
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=TRUE}
+for(dataset_name in names(proteomics_data)){
+  df = proteomics_data[[dataset_name]][["norm_filtered"]][["pca_b"]]$pcax
+  p = ggplot(df) + 
+      geom_point(aes(x=PC1, y=PC2,col=randgroup, shape=sex)) +
+      ggtitle(dataset_name)
+  plot(p)
+}
+```
+
+## 3.3 Correlations with clinical variables
+
+Here we analyze the top principal components (5) in each tissue and compute their association with the selected variables above (e.g., the pipeline qc metrics). We use Spearman correlation and a linear test for significance. For each dataset we also add the correlations among the metadata variables. These two analyses should be interpreted together, as the analyzed variables are not independent.
+
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE}
+pcs_vs_qc_var_report = c()
+metadata_variable_assoc_report = c()
+for(dataset_name in names(proteomics_data)){
+  # Get the projected PCs
+  curr_pcax = proteomics_data[[dataset_name]][["norm_filtered"]][["pca_b"]][[1]]
+  curr_pcax = curr_pcax[,grepl("^PC",names(curr_pcax))]
+  curr_pipeline_meta = proteomics_data[[dataset_name]]$sample_meta
+  curr_data_samples = rownames(curr_pcax)
+  curr_meta = pheno_data$viallabel_data[curr_data_samples,biospec_cols]
+  # remove metadata variables with NAs
+  curr_meta = curr_meta[,!apply(is.na(curr_meta),2,any)]
+   # remove bid and pid
+  curr_meta = curr_meta[,!grepl("pid|bid",names(curr_meta))]
+  # Add batch
+  curr_meta$plex = as.numeric(
+    as.factor(curr_pipeline_meta[curr_data_samples,"tmt_plex"]))
+  curr_meta_numeric_cols = sapply(curr_meta,is.numeric)
+  # Remove zero sd columns
+  curr_meta_numeric_cols[curr_meta_numeric_cols] =
+    apply(curr_meta[,curr_meta_numeric_cols],2,sd)>0
+  
+  corrs = cor(curr_pcax,curr_meta[,curr_meta_numeric_cols],method="spearman")
+  corrsp = pairwise_eval(
+    curr_pcax,curr_meta[,curr_meta_numeric_cols],func=pairwise_association_wrapper,
+    f=1,max_num_vals_for_discrete=8)
+  
+  # Some ggplots have to be printed to be shown in the notebook
+  print(ggcorrplot(t(corrs),lab=TRUE,lab_size=2.5,hc.order = F) +
+    ggtitle(dataset_name) +
+    theme(plot.title = element_text(hjust = 0.5,size=20)))
+  
+  for(i in 1:nrow(corrsp)){
+    for(j in 1:ncol(corrsp)){
+      if(corrsp[i,j]>p_thr){next}
+      pcs_vs_qc_var_report = rbind(pcs_vs_qc_var_report,
+            c(dataset_name,
+              rownames(corrsp)[i],colnames(corrsp)[j],corrs[i,j],corrsp[i,j])
+            )
+    }
+  }
+  colnames(pcs_vs_qc_var_report) = c("Dataset(tissue,site)","PC",
+                                  "qc_metric","rho(spearman)","p-value")
+  
+  ####
+  # compute correlations among the metadata variables
+  ####
+  corrs = cor(curr_meta[,curr_meta_numeric_cols],method="spearman")
+  corrsp = pairwise_eval(
+    curr_meta[,curr_meta_numeric_cols],func=pairwise_association_wrapper,
+    f=1,max_num_vals_for_discrete=8)
+  
+  # Some ggplots have to be printed to be shown in the notebook
+  print(ggcorrplot(corrs,lab=TRUE,lab_size=2.5,hc.order = T))
+  
+  for(n1 in rownames(corrsp)){
+    for(n2 in rownames(corrsp)){
+      if(n1==n2){break}
+      if(n1 %in% biospec_cols &&
+         n2 %in% biospec_cols) {next}
+      if(corrsp[n1,n2]>p_thr){next}
+      metadata_variable_assoc_report = rbind(metadata_variable_assoc_report,
+            c(dataset_name,n1,n2,corrs[n1,n2],corrsp[n1,n2])
+      )
+    }
+  }
+  if(!is.null(dim(metadata_variable_assoc_report))){
+    colnames(metadata_variable_assoc_report) = c(
+      "Dataset(tissue,site)","Var1","Var2","rho(spearman)","p-value")
+  }
+
+}
+# Format the reports - for a nicer presentation in a table
+pcs_vs_qc_var_report[,5] = format(
+  as.numeric(pcs_vs_qc_var_report[,5]),digits=3)
+pcs_vs_qc_var_report[,4] = format(
+  as.numeric(pcs_vs_qc_var_report[,4]),digits=3)
+metadata_variable_assoc_report[,5] = format(
+  as.numeric(metadata_variable_assoc_report[,5]),digits=3)
+metadata_variable_assoc_report[,4] = format(
+  as.numeric(metadata_variable_assoc_report[,4]),digits=3)
+```
+
+### 3.3.1 Summary of significant clinical variables
+
+Table of clinical variables with significant correlations to the data
+
+```{r}
+kable(pcs_vs_qc_var_report,longtable=TRUE,
+      caption = "Correlations between PCs and other variables")  %>%
+  kable_styling(latex_options = c("repeat_header"),font_size = 8)
+
+kable(metadata_variable_assoc_report,longtable=TRUE,
+      caption = "Correlations between metadata variables")%>%
+  kable_styling(latex_options = c("repeat_header"),font_size = 8)
+```
+
+## 3.4 PCA outliers
+
+In this analysis, outliers are flagged by examining the boxplot of each PC, extending its whiskers to three times the inter-quantile range away from the boxplot. Samples outside this range are then flagged.
+
+**Note that samples are flagged using an automatic analysis of the principal components. Such analyses may flag samples because of true biological effects and thus further examination is required before determining if flagged samples represent low quality samples. Moreover, note that we plot outliers for the rii (raw intensitied) data as well. Typically, outliers from such datasets will not appear in the bettern normalized ratio data.**
+
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE}
+pca_outliers_report = c()
+for(dataset_name in names(proteomics_data)){
+  # Get the projected PCs
+  curr_pcax = proteomics_data[[dataset_name]][["norm_filtered"]][["pca_b"]][[1]]  
+  # Univariate: use IQRs
+  pca_outliers = c()
+  for(j in 1:num_pcs_for_outlier_analysis){
+    
+    #Identify outlier values
+    outlier_values <- boxplot.stats(curr_pcax[,j],coef = 3)$out
+    outlier_id <- curr_pcax[,j] %in% outlier_values
+    
+    #Extract outlier names
+    outlier_values <- curr_pcax[outlier_id,j]
+    names(outlier_values) <- rownames(curr_pcax)[outlier_id]
+    
+    for(outlier in names(outlier_values)){
+      pca_outliers_report = rbind(pca_outliers_report,
+       c(dataset_name,paste("PC",j,sep=""),outlier,
+         format(outlier_values[outlier],digits=5))
+      )
+      if(!is.element(outlier,names(pca_outliers))){
+        pca_outliers[outlier] = outlier_values[outlier]
+      }
+    }
+  }
+  
+  # Plot the outliers
+  if(length(pca_outliers)>0){
+    df = data.frame(curr_pcax,
+                outliers = rownames(curr_pcax) %in% names(pca_outliers))
+    col = rep("black",nrow(df))
+    col[df$outliers] = "green"
+    plot(df$PC1,df$PC2,pch = as.numeric(df$outliers),col=col,lwd=2,cex=1,
+         main = paste(dataset_name,"flagged outliers"),
+         xlab = "PC1",ylab="PC2")
+    plot(df$PC3,df$PC4,pch = as.numeric(df$outliers),col=col,lwd=2,cex=1,
+         main = paste(dataset_name,"flagged outliers"),
+         xlab = "PC3",ylab="PC4")
+  }
+}
+
+if(!is.null(dim(pca_outliers_report))){
+  colnames(pca_outliers_report) =  c("dataset","PC","sample","score")
+}
+```
+
+## 3.5 Sex prediction accuracy
+
+Here we map features to their chromosomes and then use the X and Y chromosomes to train a classifier for predicting sex. Note that unlike the sequencing platforms we use the molecular features from the data, which requires running a regularized learning algorithm. We use linear SVM as it seems to produce reasonable results.
+
+```{r}
+entrez2chr = as.list(org.Rn.egCHR)
+symbol2entrez = as.list(org.Rn.egSYMBOL2EG)
+sex_pred_err_rates = c()
+sex_check_outliers = c()
+for(dataset_name in names(proteomics_data)){
+  curr_data = proteomics_data[[dataset_name]][["norm_filtered"]][[2]]
+  curr_annot = proteomics_data[[dataset_name]]$row_annot
+  # get the correct row annotation (was filtered by NAs above)
+  feature_inds = proteomics_data[[dataset_name]][["norm_filtered"]]$feature_inds
+  curr_annot = curr_annot[feature_inds,]
+  # map to entrez ids
+  curr_entrez = symbol2entrez[curr_annot[,"gene_symbol"]]
+  # take rows with a unique entrez id
+  single_entrez  = sapply(curr_entrez,length)==1
+  curr_data = curr_data[single_entrez,]
+  curr_annot = curr_annot[single_entrez,]
+  curr_entrez = unlist(curr_entrez[single_entrez])
+  # map to chromosomes
+  curr_chrs = entrez2chr[curr_entrez]
+  # limit the data to X and Y chromosomes
+  chrr_y_genes = sapply(curr_chrs,function(x)any(x=="Y" | x=="X"))
+  chrr_y_genes[is.na(chrr_y_genes)] = F
+  if(sum(chrr_y_genes,na.rm=TRUE)<2){next}
+  sex = pheno_data$viallabel_data[colnames(curr_data),"registration.sex"]
+  df = data.frame(sex=as.factor(sex),t(curr_data[chrr_y_genes,]))
+  df = df[,colSums(is.na(df))==0]
+  # run an svm classifier
+  train_control <- caret::trainControl(method = "cv", number = nrow(df),
+                                savePredictions = TRUE)
+  # train the model on training set
+  model <- caret::train(sex ~ .,data = df,
+               trControl = train_control,method = "svmLinear2")
+  # loocv results
+  cv_res = model$pred
+  cv_res = cv_res[cv_res[,"cost"]==0.5,]
+  cv_errors = cv_res[,1] != cv_res[,2]
+  acc = 1 - (sum(cv_errors)/nrow(cv_res))
+  print(paste(
+    "In dataset",dataset_name,
+    "sex prediction using X,Y chromosomes, cross-validation accuracy is:",
+    round(acc,digits = 3)))
+  sex_pred_err_rates = rbind(sex_pred_err_rates,
+      c(dataset_name,mean(cv_errors))
+  )
+  err_samples = rownames(df)[cv_errors]
+  for(samp in err_samples){
+    sex_check_outliers = rbind(
+      sex_check_outliers,c(dataset_name,samp))
+  }
+}
+if(! is.null(dim(sex_check_outliers))){
+  colnames(sex_check_outliers) = c("dataset","sample")
+}
+```
+
+## 3.6 Summary of PCA and sex prediction outliers
+
+```{r}
+sample2dataset = c()
+for(dataset_name in names(proteomics_data)){
+  sample2dataset[colnames(proteomics_data[[dataset_name]]$sample_data)] = dataset_name
+}
+# add the dataset name to mop outliers
+all_flagged = NULL
+if(length(pca_outliers_report)>0){
+  all_flagged = union(all_flagged,pca_outliers_report[,"sample"])
+}
+if(length(sex_check_outliers)>0){
+  all_flagged = union(all_flagged,sex_check_outliers[,2])
+}
+
+flagged_sample_report = c()
+for(samp in all_flagged){
+  samp_dataset = sample2dataset[samp]
+  samp_metric = NULL
+  if(!is.null(dim(sex_check_outliers)) &&
+     samp %in% sex_check_outliers[,"sample"]){
+    samp_metric = c(samp_metric,"Sex-flagged")
+  }
+  if(!is.null(dim(pca_outliers_report)) &&
+     samp %in% pca_outliers_report[,"sample"]){
+    curr_pcs = pca_outliers_report[pca_outliers_report[,"sample"]==samp,"PC"]
+    samp_metric = c(samp_metric,curr_pcs)
+  }
+  flagged_sample_report = rbind(flagged_sample_report,
+      c(samp,samp_dataset,paste(samp_metric,collapse=","))
+  )
+}
+
+colnames(flagged_sample_report) = c("Viallabel","Dataset","Methods")
+kable(flagged_sample_report,longtable=TRUE,
+      caption = "Outliers detected by tissue PCA data")%>%
+  kable_styling(font_size = 8,latex_options = c("hold_position", "repeat_header"))
+```
+
+# 4. Remove outlier samples
+
+Specify samples that will be removed from differential enrichment results and from the normalized outputs produced by this notebook.
+```{r}
+#Identify samples that need to be removed as a named list for each ome
+VIALS_TO_REMOVE <- list(
+  #Samples removed from global proteome data
+  "t68-liver,prot-pr" = c("90560016806"),
+  "t55-gastrocnemius,prot-pr" = c("90252015507","90245015507","90223015507"),
+  
+  #Samples removed from global phosphoproteome data
+  "t68-liver,prot-ph" = c("90560016806"),
+  "t55-gastrocnemius,prot-ph" = c("90252015507","90245015507","90223015507"),
+  
+  #Samples removed from global acetylome data
+  "t68-liver,prot-ac" = c("90560016806"),
+  
+  #Samples removed from global ubiquitylome data
+  "t58-heart,prot-ub" = c("90559015805")
+)
+```
+
+This code removes the outlier samples from downstream differential analysis and output tables
+```{r}
+#Loop through each dataset to remove outlier samples
+for(dataset in names(VIALS_TO_REMOVE)){
+  #Remove sample from the original sample matrix
+  proteomics_data[[dataset]]$sample_data <-
+    proteomics_data[[dataset]]$sample_data %>% 
+    dplyr::select(-all_of(VIALS_TO_REMOVE[[dataset]]))
+  
+  #Remove samples from the metadata matrix
+  proteomics_data[[dataset]]$sample_meta <-
+    proteomics_data[[dataset]]$sample_meta %>% 
+    filter(!(vial_label %in% VIALS_TO_REMOVE[[dataset]]))
+  
+  # Loop through the various normalized datasets and remove the outlier sample
+  for(i in names(proteomics_data[[dataset]]$norm_filtered)){
+    if (!(i %in% c("feature_inds","pca_b","pca_w_b"))){
+      to_keep <- !(colnames(proteomics_data[[dataset]]$norm_filtered[[i]]) %in% VIALS_TO_REMOVE[[dataset]])
+      
+      proteomics_data[[dataset]]$norm_filtered[[i]] <-
+        proteomics_data[[dataset]]$norm_filtered[[i]][,to_keep]
+    }
+  }
+}
+
+```
+
+# 5. Remove contaminant proteins
+This chunk remove contaminant proteins routinely detected during MS analysis. Contaminants are removed at this step and not earlier as they may be useful for the PTM-Protein correction step and for quality control
+```{r}
+for(dataset_name in names(proteomics_data)){
+  #Identify contaminant features
+  contaminant_ids <- proteomics_data[[dataset_name]]$row_annot %>%
+    as.data.frame %>% filter(is_contaminant == TRUE) %>% rownames
+  
+  #Update feature index
+  proteomics_data[[dataset_name]]$norm_filtered$feature_inds[contaminant_ids] <- F 
+  
+  # Loop through the various normalized datasets and remove contaminant features
+  for(i in names(proteomics_data[[dataset]]$norm_filtered)){
+    if (!(i %in% c("feature_inds","pca_b","pca_w_b"))){
+      to_keep <- setdiff(rownames(proteomics_data[[dataset_name]]$norm_filtered[[i]]),
+                                          contaminant_ids)
+      proteomics_data[[dataset_name]]$norm_filtered[[i]] <-
+        proteomics_data[[dataset_name]]$norm_filtered[[i]][to_keep,]
+    }
+  }
+}
+```
+
+# 6. Differential analysis
+Differential analysis is performed using two approaches. Section 6.1 uses a model that combines both animal sexes, while section 6.2 fits a model on samples from each sex. Only results from section 6.2 are saved and uploaded to the Google bucket.
+
+Future implementations can modify Section 6.1 to account for sex-specific residuals. For example, by using generalized least squares.
+
+## 6.1 DEA without splitting sexes
+Here, we use a combined model for both sexes.
+
+First, perform DEA on non-corrected data
+```{r warning=FALSE}
+
+# a helper function for getting SEs per estimate in the timewise
+# data analysis
+limma_res_extract_se<-function(limma_res,e_fit,
+                               effect_col="logFC",t_col="t",colname=NULL){
+  # method 1
+  effects = limma_res[[effect_col]]
+  ts = limma_res[[t_col]]
+  ses1 = effects/ts
+  if(is.null(colname)){
+    return(ses1)
+  }
+  # method 2
+  ses2 = sqrt(e_fit$s2.post) * e_fit$stdev.unscaled
+  ts1 = effects/ses1
+  ts2 = effects/ses2[,colname]
+  if(max(abs(ts-ts1),na.rm = T) > 1e-10 || 
+     max(abs(ts-ts2),na.rm = T) > 1e-10 || 
+     max(abs(ts1-ts2),na.rm = T)>1e-10){
+    print("Warning: t-stats from computed ses are incompatible with limma's output")
+  }
+  return(ses2[,colname])
+}
+
+ftest_res = c() # keeps all ftest results
+sex_ftest_res = c() # keeps the sex-specific f-tests
+dataset2num_discoveries = c() # count stats
+tpDA = c() # keep the timewise results
+
+for(dataset_name in names(proteomics_data)){
+  
+  
+  #Extract current dataset
+  x = proteomics_data[[dataset_name]][["norm_filtered"]][[1]]
+  
+  #Extract sample annotations
+  x_annot = proteomics_data[[dataset_name]]$row_annot
+  feature_inds = proteomics_data[[dataset_name]][["norm_filtered"]]$feature_inds
+  x_annot = x_annot[feature_inds,]
+    covs = data.frame(
+    sex = pheno_data$viallabel_data[colnames(x),"registration.sex"],
+    timepoint = pheno_data$viallabel_data[colnames(x),"timepoint"],
+    is_control = pheno_data$viallabel_data[colnames(x),"is_control"]
+  )
+  covs$sex[covs$sex=="2"] = "M"; covs$sex[covs$sex=="1"]="F"
+  rownames(covs) = colnames(x)
+  
+  #Specify the model
+  full_model_str = "~1+sex+group+sex:group"
+  
+  
+  
+  # F-test analysis - training-dea table
+  # Fit a single limma model for F-test.
+  # Perform F-test using the exercise groups and group:sex interactions
+  # see https://support.bioconductor.org/p/12119/ and the limma guide
+  group=factor(paste(covs$timepoint,covs$is_control,sep="_"),
+               levels=c("8_1","1_0","2_0", "4_0", "8_0"))
+  covs$group=group
+  des = model.matrix(as.formula(full_model_str),data=covs)
+  is_group_variable = grepl("group",colnames(des))
+  colnames(des) = gsub("group","",colnames(des))
+  colnames(des)[1] = "Intercept"
+
+  # fit the models
+  limma_model1 = lmFit(x,as.matrix(des))
+  eb_Ftest = eBayes(limma_model1)
+  
+  # Extract the results
+  res <- topTable(eb_Ftest,coef = which(is_group_variable),
+                  number = Inf, sort.by = "none")
+  
+  num_sig1 = sum(p.adjust(res$P.Value,method="fdr")<0.1,na.rm=TRUE)
+    
+  curr_f_test_res = data.frame(
+      feature_ID = rownames(x),
+      assay = strsplit(dataset_name,split=",")[[1]][2],
+      tissue = strsplit(dataset_name,split=",")[[1]][1],
+      p_value = res$P.Value,
+      adj_p_value = p.adjust(res$P.Value,method="fdr"),
+      fscore = res$`F`,
+      numNAs = rowSums(is.na(x)),
+      full_model = full_model_str,
+      reduced_model = "~1+sex"
+  )
+  
+  ftest_res = rbind(ftest_res,curr_f_test_res)
+  
+  # F-test analysis - training-sex-biased table
+  # Perform F-test using the group:sex interactions
+  inter_terms = grepl(":",colnames(des))
+  res_sex <- topTable(eb_Ftest,coef = which(inter_terms),
+                      number = Inf, sort.by = "none")
+  num_sig_sex = sum(p.adjust(res_sex$P.Value,method="fdr")<0.1,na.rm=TRUE)
+  curr_sex_f_test_res = data.frame(
+    feature_ID = rownames(x),
+    assay = strsplit(dataset_name,split=",")[[1]][2],
+    tissue = strsplit(dataset_name,split=",")[[1]][1],
+    p_value = res_sex$P.Value,
+    adj_p_value = p.adjust(res_sex$P.Value,method="fdr"),
+    fscore = res_sex$`F`,
+    numNAs = rowSums(is.na(x)),
+    full_model = "~1+sex+group+sex:group",
+    reduced_model = "~1+sex+group"
+  )
+  sex_ftest_res = rbind(sex_ftest_res,curr_sex_f_test_res)
+    
+  
+  
+  
+  
+  # T-test analysis - timewise-dea table
+  # Perform T-test using the exercise groups and group:sex interactions
+  group=factor(paste(covs$sex,covs$timepoint,covs$is_control,sep="_"))
+  des = model.matrix(~0+group)
+  colnames(des) = gsub("group","",colnames(des))
+  C_ttests = makeContrasts(
+      M_1_0 - M_8_1,M_2_0 - M_8_1,M_4_0 - M_8_1,M_8_0 - M_8_1,
+      F_1_0 - F_8_1,F_2_0 - F_8_1,F_4_0 - F_8_1,F_8_0 - F_8_1,
+      levels = des
+  )
+
+  # fit the new model
+  limma_model2 = lmFit(x,as.matrix(des))
+  lmfit.cont <- contrasts.fit(limma_model2, C_ttests)
+  lmfit.cont.ebayes <- eBayes(lmfit.cont)
+  
+  # count the results at 10% FDR
+  t_ps = c(lmfit.cont.ebayes$p.value)
+  suppressWarnings({pthr = max(-1,max(t_ps[p.adjust(t_ps,method="BY")<0.1]))})
+  num_sig2 = sum(apply(lmfit.cont.ebayes$p.value<pthr,1,any),na.rm = T)
+  suppressWarnings({pthr = max(-1,max(t_ps[p.adjust(t_ps,method="fdr")<0.1]))})
+  num_sig3 = sum(apply(lmfit.cont.ebayes$p.value<pthr,1,any),na.rm = T)
+  v_counts = c(dataset=dataset_name,ftest=num_sig1,
+               sex_ftest=num_sig_sex,ttests_BY=num_sig2,ttests_BH=num_sig3)
+  dataset2num_discoveries = rbind(dataset2num_discoveries,v_counts)
+
+  # extract contrast info
+  for(col in colnames(lmfit.cont.ebayes$t)){
+    curr_sex = strsplit(col,split="_")[[1]][1]
+    sex_str = "male"
+    if(curr_sex=="F"){sex_str="female"}
+    curr_tp = strsplit(col,split="_")[[1]][2]
+    samps = rownames(covs)[covs$sex==curr_sex &
+                 (covs$timepoint==curr_tp | covs$is_control==1)]
+    if(any(table(covs[samps,"is_case"])<2)){
+        print(paste("in dataset:",dataset,"skipping time point",col,"of sex",sex))
+        print(paste("reason: there is a group with less than 2 samples"))
+        next
+    }
+    limma_res = topTable(lmfit.cont.ebayes,
+                    coef = col,number = nrow(x),sort.by = "none")
+    
+    curr_res = data.frame(
+      feature_ID = rownames(x),
+      assay = strsplit(dataset_name,split=",")[[1]][2],
+      tissue = strsplit(dataset_name,split=",")[[1]][1],
+      sex = sex_str,
+      logFC_se = limma_res_extract_se(limma_res,lmfit.cont.ebayes),
+      logFC = limma_res$logFC,
+      tscore = limma_res$t,
+      covariates = NA,
+      comparison_group = paste0(curr_tp,"w"),
+      p_value = limma_res$P.Value,
+      adj_p_value = limma_res$adj.P.Val
+    )
+    # add group info
+    case_samps = samps[covs[samps,"is_case"]=="1"]
+    curr_res$comparison_average_intensity = apply(x[,case_samps],1,mean)
+    control_samps = samps[covs[samps,"is_case"]!="1"]
+    curr_res$reference_average_intensity = apply(x[,control_samps],1,mean)
+    # add NA counts
+    curr_res$numNAs = rowSums(is.na(x[,samps]))
+    # add the results
+    tpDA = rbind(tpDA,curr_res)
+  }
+}
+```
+
+Perform DEA on PTM protein-corrected data.
+```{r warning=FALSE}
+#Perform DEA only on PTM data
+ptm_datasets <- grep("prot-pr",names(proteomics_data),value = T,invert = T)
+
+for(dataset_name in ptm_datasets){
+  x = proteomics_data[[dataset_name]][["norm_filtered"]][["norm_data_b_protein_corrected"]]
+  #Extract sample annotations
+  x_annot = proteomics_data[[dataset_name]]$row_annot
+  feature_inds = proteomics_data[[dataset_name]][["norm_filtered"]]$feature_inds
+  x_annot = x_annot[feature_inds,]
+    covs = data.frame(
+    sex = pheno_data$viallabel_data[colnames(x),"registration.sex"],
+    timepoint = pheno_data$viallabel_data[colnames(x),"timepoint"],
+    is_control = pheno_data$viallabel_data[colnames(x),"is_control"]
+  )
+  covs$sex[covs$sex=="2"] = "M";covs$sex[covs$sex=="1"]="F"
+  rownames(covs) = colnames(x)
+  
+  #Specify the model
+  full_model_str = "~1+sex+group+sex:group"
+  
+  # F-test analysis - training-dea table
+  # Fit a single limma model for F-test.
+  # Perform F-test using the exercise groups and group:sex interactions
+  # see https://support.bioconductor.org/p/12119/ and the limma guide
+  group=factor(paste(covs$timepoint,covs$is_control,sep="_"),
+               levels=c("8_1","1_0","2_0", "4_0", "8_0"))
+  covs$group=group
+  des = model.matrix(as.formula(full_model_str),data=covs)
+  is_group_variable = grepl("group",colnames(des))
+  colnames(des) = gsub("group","",colnames(des))
+  colnames(des)[1] = "Intercept"
+
+  # fit the models
+  limma_model1 = lmFit(x,as.matrix(des))
+  eb_Ftest = eBayes(limma_model1)
+  
+  # Extract the results
+  res <- topTable(eb_Ftest,coef = which(is_group_variable),
+                  number = Inf, sort.by = "none")
+  
+  num_sig1 = sum(p.adjust(res$P.Value,method="fdr")<0.1,na.rm=TRUE)
+    
+  curr_f_test_res = data.frame(
+      feature_ID = rownames(x),
+      assay = paste0(strsplit(dataset_name,split=",")[[1]][2],"-protein-corrected"),
+      tissue = strsplit(dataset_name,split=",")[[1]][1],
+      p_value = res$P.Value,
+      adj_p_value = p.adjust(res$P.Value,method="fdr"),
+      fscore = res$`F`,
+      numNAs = rowSums(is.na(x)),
+      full_model = full_model_str,
+      reduced_model = "~1+sex"
+  )
+  
+  ftest_res = rbind(ftest_res,curr_f_test_res)
+
+  
+  # F-test analysis - training-sex-biased table
+  # Perform F-test using the group:sex interactions
+  inter_terms = grepl(":",colnames(des))
+  res_sex <- topTable(eb_Ftest,coef = which(inter_terms),
+                      number = Inf, sort.by = "none")
+  num_sig_sex = sum(p.adjust(res_sex$P.Value,method="fdr")<0.1,na.rm=TRUE)
+  curr_sex_f_test_res = data.frame(
+    feature_ID = rownames(x),
+    assay = paste0(strsplit(dataset_name,split=",")[[1]][2],"-protein-corrected"),
+    tissue = strsplit(dataset_name,split=",")[[1]][1],
+    p_value = res_sex$P.Value,
+    adj_p_value = p.adjust(res_sex$P.Value,method="fdr"),
+    fscore = res_sex$`F`,
+    numNAs = rowSums(is.na(x)),
+    full_model = "~1+sex+group+sex:group",
+    reduced_model = "~1+sex+group"
+  )
+  sex_ftest_res = rbind(sex_ftest_res,curr_sex_f_test_res)
+    
+  
+  # T-test analysis - timewise-dea table
+  # Perform T-test using the exercise groups and group:sex interactions
+  group=factor(paste(covs$sex,covs$timepoint,covs$is_control,sep="_"))
+  des = model.matrix(~0+group)
+  colnames(des) = gsub("group","",colnames(des))
+  C_ttests = makeContrasts(
+      M_1_0 - M_8_1,M_2_0 - M_8_1,M_4_0 - M_8_1,M_8_0 - M_8_1,
+      F_1_0 - F_8_1,F_2_0 - F_8_1,F_4_0 - F_8_1,F_8_0 - F_8_1,
+      levels = des
+  )
+
+  # fit the new model
+  limma_model2 = lmFit(x,as.matrix(des))
+  lmfit.cont <- contrasts.fit(limma_model2, C_ttests)
+  lmfit.cont.ebayes <- eBayes(lmfit.cont)
+  
+  # count the results at 10% FDR
+  t_ps = c(lmfit.cont.ebayes$p.value)
+  suppressWarnings({pthr = max(-1,max(t_ps[p.adjust(t_ps,method="BY")<0.1]))})
+  num_sig2 = sum(apply(lmfit.cont.ebayes$p.value<pthr,1,any),na.rm = T)
+  suppressWarnings({pthr = max(-1,max(t_ps[p.adjust(t_ps,method="fdr")<0.1]))})
+  num_sig3 = sum(apply(lmfit.cont.ebayes$p.value<pthr,1,any),na.rm = T)
+  v_counts = c(dataset=dataset_name,ftest=num_sig1,
+               sex_ftest=num_sig_sex,ttests_BY=num_sig2,ttests_BH=num_sig3)
+  dataset2num_discoveries = rbind(dataset2num_discoveries,v_counts)
+
+  # extract contrast info
+  for(col in colnames(lmfit.cont.ebayes$t)){
+    curr_sex = strsplit(col,split="_")[[1]][1]
+    sex_str = "male"
+    if(curr_sex=="F"){sex_str="female"}
+    curr_tp = strsplit(col,split="_")[[1]][2]
+    samps = rownames(covs)[covs$sex==curr_sex &
+                 (covs$timepoint==curr_tp | covs$is_control==1)]
+    if(any(table(covs[samps,"is_case"])<2)){
+        print(paste("in dataset:",dataset,"skipping time point",col,"of sex",sex))
+        print(paste("reason: there is a group with less than 2 samples"))
+        next
+    }
+    limma_res = topTable(lmfit.cont.ebayes,
+                    coef = col,number = nrow(x),sort.by = "none")
+    
+    curr_res = data.frame(
+      feature_ID = rownames(x),
+      assay = paste0(strsplit(dataset_name,split=",")[[1]][2],"-protein-corrected"),
+      tissue = strsplit(dataset_name,split=",")[[1]][1],
+      sex = sex_str,
+      logFC_se = limma_res_extract_se(limma_res,lmfit.cont.ebayes),
+      logFC = limma_res$logFC,
+      tscore = limma_res$t,
+      covariates = NA,
+      comparison_group = paste0(curr_tp,"w"),
+      p_value = limma_res$P.Value,
+      adj_p_value = limma_res$adj.P.Val
+    )
+    # add group info
+    case_samps = samps[covs[samps,"is_case"]=="1"]
+    curr_res$comparison_average_intensity = apply(x[,case_samps],1,mean,na.rm=TRUE)
+    control_samps = samps[covs[samps,"is_case"]!="1"]
+    curr_res$reference_average_intensity = apply(x[,control_samps],1,mean,na.rm=TRUE)
+    # add NA counts
+    curr_res$numNAs = rowSums(is.na(x[,samps]))
+    # add the results
+    tpDA = rbind(tpDA,curr_res)
+  }
+}
+```
+
+## 6.2 DEA separating sexes
+Here, we perform DEA by fitting models to only Male or only Female samples.
+
+First run on non-corrected data.
+```{r warning=FALSE}
+
+ftest_res_split_sex = c() # keeps all ftest results
+tpDA_split_sex = c() # keep the timewise results
+
+for(dataset_name in names(proteomics_data)){
+  
+  #Extract current dataset and metadata
+  x = proteomics_data[[dataset_name]][["norm_filtered"]][[1]]
+  x_annot = proteomics_data[[dataset_name]]$row_annot
+  feature_inds = proteomics_data[[dataset_name]][["norm_filtered"]]$feature_inds
+  x_annot = x_annot[feature_inds,]
+  
+  #Specify covariates
+  covs = data.frame(
+    sex = pheno_data$viallabel_data[colnames(x),"registration.sex"],
+    timepoint = pheno_data$viallabel_data[colnames(x),"timepoint"],
+    is_control = pheno_data$viallabel_data[colnames(x),"is_control"]
+  )
+  covs$sex[covs$sex=="2"] = "M";covs$sex[covs$sex=="1"]="F"
+  rownames(covs) = colnames(x)
+  
+  #Variables that save sex-specific results
+  sex_res = list() #F-test result
+  sex_ttest_res = list() #T-test result
+  
+  for(SEX in c('M','F')){
+    curr_meta = covs %>% filter(sex == SEX) %>% mutate(group = paste(timepoint,is_control,sep="_"))
+    curr_counts = x[,rownames(curr_meta)]
+    
+    ###################################################################
+    # F-test analysis - training-dea table
+    
+    #Extract treatment covariate
+    tr <- factor(paste(curr_meta$timepoint,curr_meta$is_control,sep="_"),
+                 levels=c("8_1","1_0","2_0","4_0","8_0"))
+    #Generate the experimental model
+    design <- model.matrix(~ 1+tr)
+    fit <- lmFit(curr_counts, design)
+    fit.eb <- eBayes(fit)
+    
+    
+    #Extract results
+    res = topTable(fit.eb, coef = 2:5, n=nrow(fit.eb))
+    dt = data.table(tissue=str_split(dataset_name,",")[[1]][1],
+                    assay=str_split(dataset_name,",")[[1]][2],
+                    feature_ID=rownames(res),
+                    fscore=res$`F`,
+                    p_value = res$P.Value,
+                    full_model = "~1+group",
+                    reduced_model = "~1")
+    sex_res[[SEX]] = dt
+    
+    ###############################################################
+    # T-test analysis - timewise-dea table
+    # Perform T-test using the exercise groups
+    
+    design = model.matrix(~0+tr)
+    
+    #Set contrasts
+    cont.matrix = makeContrasts(
+      tr1_0 - tr8_1, tr2_0 - tr8_1, tr4_0 - tr8_1, tr8_0 - tr8_1, 
+      levels = design
+    )
+    
+    colnames(cont.matrix) = c("1w","2w","4w","8w")
+    
+    # Fit the new model
+    limma_model2 = lmFit(curr_counts,design)
+    lmfit.cont <- contrasts.fit(limma_model2, cont.matrix)
+    lmfit.cont.ebayes <- eBayes(lmfit.cont)
+
+    #Extract results for each timepoint
+    for(curr_tp in colnames(lmfit.cont.ebayes$t)){
+      
+      #Extract results
+      limma_res = topTable(lmfit.cont.ebayes,
+                           coef = curr_tp,number = Inf,sort.by = "none")
+    
+      curr_res = data.frame(
+        feature_ID = rownames(limma_res),
+        assay = strsplit(dataset_name,split=",")[[1]][2],
+        tissue = strsplit(dataset_name,split=",")[[1]][1],
+        sex = if_else(SEX == "M","male","female"),
+        logFC_se = limma_res_extract_se(limma_res,lmfit.cont.ebayes),
+        logFC = limma_res$logFC,
+        tscore = limma_res$t,
+        covariates = NA,
+        comparison_group = curr_tp,
+        p_value = limma_res$P.Value
+      )
+      # Add group average intensities
+      case_samps = covs %>% 
+        filter(sex == SEX &
+                 timepoint == substr(curr_tp,1,1)&
+                 is_control == 0) %>%
+        rownames()
+      curr_res$comparison_average_intensity = apply(x[,case_samps],1,mean,na.rm=TRUE)
+      
+      control_samps = covs %>% 
+        filter(sex == SEX &
+                 is_control == 1) %>%
+        rownames()
+      curr_res$reference_average_intensity = apply(x[,control_samps],1,mean,na.rm=TRUE)
+      
+      # Add NA counts
+      curr_res$numNAs = rowSums(is.na(x[,c(case_samps,control_samps)]))
+      
+      # Add the results
+      tpDA_split_sex = rbind(tpDA_split_sex,curr_res)
+    }
+  }
+  
+  #Merge F-test results
+  merged = data.frame(merge(sex_res[['M']], sex_res[['F']], 
+                            by=c("tissue","assay","feature_ID","full_model","reduced_model"), 
+                            suffixes=c('_male','_female'))) %>%
+    mutate(p_value_male = replace_na(p_value_male,1),
+           p_value_female = replace_na(p_value_female,1)) %>%
+    mutate(p_value = map2_dbl(p_value_male,p_value_female,function(x,y){sumlog(c(x,y))$p}))
+  
+  ftest_res_split_sex <- rbind(ftest_res_split_sex,merged)
+}
+```
+
+
+Next, run on protein-corrected PTM data
+```{r warning=FALSE}
+#Perform DEA only on PTM data
+ptm_datasets <- grep("prot-pr", names(proteomics_data),value = T,invert = T)
+
+for(dataset_name in ptm_datasets){
+  
+  #Extract current dataset and metadata
+  x = proteomics_data[[dataset_name]][["norm_filtered"]][["norm_data_b_protein_corrected"]]
+  x_annot = proteomics_data[[dataset_name]]$row_annot
+  feature_inds = proteomics_data[[dataset_name]][["norm_filtered"]]$feature_inds
+  x_annot = x_annot[feature_inds,]
+  
+  #Specify covariates
+  covs = data.frame(
+    sex = pheno_data$viallabel_data[colnames(x),"registration.sex"],
+    timepoint = pheno_data$viallabel_data[colnames(x),"timepoint"],
+    is_control = pheno_data$viallabel_data[colnames(x),"is_control"]
+  )
+  covs$sex[covs$sex=="2"] = "M";covs$sex[covs$sex=="1"]="F"
+  rownames(covs) = colnames(x)
+  
+  #Variables that save sex-specific results
+  sex_res = list() #F-test result
+  sex_ttest_res = list() #T-test result
+  
+  for(SEX in c('M','F')){
+    curr_meta = covs %>% filter(sex == SEX) %>% mutate(group = paste(timepoint,is_control,sep="_"))
+    curr_counts = x[,rownames(curr_meta)]
+
+    ###################################################################
+    # F-test analysis - training-dea table
+    
+    #Extract treatment covariate
+    tr <- factor(paste(curr_meta$timepoint,curr_meta$is_control,sep="_"),
+                 levels=c("8_1","1_0","2_0","4_0","8_0"))
+    #Generate the experimental model
+    design <- model.matrix(~ 1+tr)
+    fit <- lmFit(curr_counts, design)
+    fit.eb <- eBayes(fit)
+    
+    
+    #Extract results
+    res = topTable(fit.eb, coef = 2:5, n=nrow(fit.eb))
+    dt = data.table(
+      tissue=str_split(dataset_name,",")[[1]][1],
+      assay = paste0(strsplit(dataset_name,split=",")[[1]][2],"-protein-corrected"),
+      feature_ID=rownames(res),
+      fscore=res$`F`,
+      p_value = res$P.Value,
+      full_model = "~1+group",
+      reduced_model = "~1")
+    sex_res[[SEX]] = dt
+    
+    ###############################################################
+    # T-test analysis - timewise-dea table
+    # Perform T-test using the exercise groups
+    
+    design = model.matrix(~0+tr)
+    
+    #Set contrasts
+    cont.matrix = makeContrasts(
+      tr1_0 - tr8_1, tr2_0 - tr8_1, tr4_0 - tr8_1, tr8_0 - tr8_1, 
+      levels = design
+    )
+    
+    colnames(cont.matrix) = c("1w","2w","4w","8w")
+
+    
+    # Fit the new model
+    limma_model2 = lmFit(curr_counts,design)
+    lmfit.cont <- contrasts.fit(limma_model2, cont.matrix)
+    lmfit.cont.ebayes <- eBayes(lmfit.cont)
+    
+
+    #Extract results for each timepoint
+    for(curr_tp in colnames(lmfit.cont.ebayes$t)){
+      
+      #Extract results
+      limma_res = topTable(lmfit.cont.ebayes,
+                           coef = curr_tp,
+                           number = Inf,
+                           sort.by = "none")
+    
+      curr_res = data.frame(
+        feature_ID = rownames(limma_res),
+        assay = paste0(strsplit(dataset_name,split=",")[[1]][2],"-protein-corrected"),
+        tissue = strsplit(dataset_name,split=",")[[1]][1],
+        sex = if_else(SEX == "M","male","female"),
+        logFC_se = limma_res_extract_se(limma_res,lmfit.cont.ebayes),
+        logFC = limma_res$logFC,
+        tscore = limma_res$t,
+        covariates = NA,
+        comparison_group = curr_tp,
+        p_value = limma_res$P.Value
+      )
+      # Add group average intensities
+      case_samps = covs %>% 
+        filter(sex == SEX &
+                 timepoint == substr(curr_tp,1,1)&
+                 is_control == 0) %>%
+        rownames()
+      curr_res$comparison_average_intensity = apply(x[,case_samps],1,mean,na.rm=TRUE)
+      
+      control_samps = covs %>% 
+        filter(sex == SEX &
+                 is_control == 1) %>%
+        rownames()
+      curr_res$reference_average_intensity = apply(x[,control_samps],1,mean,na.rm=TRUE)
+      
+      # Add NA counts
+      curr_res$numNAs = rowSums(is.na(x[,c(case_samps,control_samps)]))
+      
+      # Add the results
+      tpDA_split_sex = rbind(tpDA_split_sex,curr_res)
+    }
+  }
+  
+  #Merge F-test results
+  merged = data.frame(merge(sex_res[['M']], sex_res[['F']], 
+                            by=c("tissue","assay","feature_ID","full_model","reduced_model"), 
+                            suffixes=c('_male','_female'))) %>%
+    mutate(p_value_male = replace_na(p_value_male,1),
+           p_value_female = replace_na(p_value_female,1)) %>%
+    mutate(p_value = map2_dbl(p_value_male,p_value_female,function(x,y){sumlog(c(x,y))$p}))
+  
+  ftest_res_split_sex <- rbind(ftest_res_split_sex,merged)
+}
+```
+
+Scatter plots are displayed below to assess the effects of protein correction of PTM data on the DEA results.
+```{r}
+ptm_datasets <- grep("prot-pr", names(proteomics_data),value = T,invert = T)
+
+for(dataset_name in ptm_datasets){
+  cur_tissue <- str_split_fixed(dataset_name,",",2)[1]
+  cur_assay <- str_split_fixed(dataset_name,",",2)[2]
+
+  uncorrected <-  ftest_res_split_sex %>%
+    filter(tissue == cur_tissue &
+             assay == cur_assay)
+
+  corrected <- ftest_res_split_sex %>%
+    filter(tissue == cur_tissue &
+             (assay == paste0(cur_assay,"-protein-corrected")))
+
+  dat <- inner_join(uncorrected,corrected,
+                    by = c("tissue","feature_ID","full_model","reduced_model"),
+                    suffix = c(".uncorrected",".corrected"))
+
+  g <- ggplot(dat, aes(x = -log10(p_value.uncorrected),
+                  y = -log10(p_value.corrected)))+
+    geom_point(alpha=0.01)+
+    theme_bw()+
+    geom_smooth(method="lm",formula = y~x)+
+    labs(x = "Uncorrected PTM training-dea\n-log10(p-val)",
+         y = "Protein-corrected PTM training-dea\n-log10(p-val)",
+         title= dataset_name)
+  
+  plot(g)
+}
+```
+
+
+## 6.3 Save DEA results
+
+Save DEA results that split datasets by sex.
+```{r}
+
+tissue_assay_comb = unique(tpDA_split_sex[,c("tissue","assay")])
+
+# timewise tables
+for(i in 1:nrow(tissue_assay_comb)){
+  tissue = tissue_assay_comb[i,1]
+  assay = tissue_assay_comb[i,2]
+  currDA = tpDA_split_sex[tpDA_split_sex$tissue == tissue & tpDA_split_sex$assay == assay,]
+  local_fname = file.path(local_data_dir, paste0("pass1b-06_",tissue,"_",assay,"_timewise-dea_",suffix))
+  curr_out_bucket = paste0(out_bucket,str_extract(assay,"prot-.."),"/",dea_folder_name,"/")
+  message("Write Local: ", local_fname)
+  write.table(currDA,
+              file=local_fname,
+              sep="\t",
+              quote=FALSE,
+              row.names = FALSE,
+              col.names = TRUE)
+  if(upload_to_bucket){
+    cmd = paste(gsutil_cmd, "-m cp", local_fname, curr_out_bucket)
+    message("Copy to Bucket: ", cmd)
+    system(cmd)
+  }
+}
+
+# f-test tables
+for(i in 1:nrow(tissue_assay_comb)){
+  tissue = tissue_assay_comb[i,1]
+  assay = tissue_assay_comb[i,2]
+  currTable = ftest_res_split_sex[ftest_res_split_sex$tissue == tissue & ftest_res_split_sex$assay==assay,]
+  local_fname = file.path(local_data_dir, paste0("pass1b-06_",tissue,"_",assay,"_training-dea_",suffix))
+  curr_out_bucket = paste0(out_bucket,str_extract(assay,"prot-.."),"/",dea_folder_name,"/")
+  message("Write Local: ", local_fname)
+  write.table(currTable,
+              file=local_fname,
+              sep="\t",
+              quote=FALSE,
+              row.names = FALSE,
+              col.names = TRUE)
+  if(upload_to_bucket){
+    cmd = paste(gsutil_cmd,"-m cp",local_fname,curr_out_bucket)
+    message("\tCopy to Bucket: ", cmd)
+    system(cmd)
+  }
+}
+
+```
+
+
+
+
+# 7. Save normalized data to output bucket
+
+Save normalized and batch corrected data
+```{r,eval=TRUE}
+
+for(dataset_name in names(proteomics_data)){
+  
+  #Normalized and batch corrected data
+  x = proteomics_data[[dataset_name]][["norm_filtered"]][["norm_data_b"]]
+  
+  #Normalized, batch corrected, and imputed
+  x_imp = proteomics_data[[dataset_name]][["norm_filtered"]][["norm_data_b_imp"]]
+  
+  #Feature annotations
+  x_annot = proteomics_data[[dataset_name]]$row_annot
+  
+  # get the correct row annotation (was filtered by NAs above)
+  feature_inds = proteomics_data[[dataset_name]][["norm_filtered"]]$feature_inds
+  x_annot = x_annot[feature_inds,]
+  
+  arr = strsplit(dataset_name,split=",")[[1]]
+  curr_ome = tolower(arr[2])
+  curr_t = tolower(arr[1])
+  out_b = paste0(out_bucket,curr_ome,"/data/")
+  
+  # add bid and pid
+  x_bids = pheno_data$viallabel_data[colnames(x),"bid"]
+  x_pids = pheno_data$viallabel_data[colnames(x),"pid"]
+  newx = x
+  for(j in 1:ncol(newx)){newx[,j] = round(as.numeric(newx[,j]),digits=5)}
+  newx = rbind(x_bids,newx)
+  newx = rbind(x_pids,newx)
+  newx = rbind(colnames(x),newx)
+  colnames(newx) = NULL
+  
+  newx_imp = x_imp
+  for(j in 1:ncol(newx_imp)){newx_imp[,j] = round(as.numeric(newx_imp[,j]),digits=5)}
+  newx_imp = rbind(x_bids,newx_imp)
+  newx_imp = rbind(x_pids,newx_imp)
+  newx_imp = rbind(colnames(x_imp),newx_imp)
+  colnames(newx_imp) = NULL
+  
+  # a simple sanity check
+  m = newx[-c(1:3),]
+  mode(m) = "numeric"
+  if(!all(abs(m-x)< 1e-05,na.rm=TRUE)){
+    print("Error in parsing the matrix, breaking")
+    break
+  }
+  # a simple sanity check
+  m = newx_imp[-c(1:3),]
+  mode(m) = "numeric"
+  if(!all(abs(m-x)< 1e-05,na.rm=TRUE)){
+    print("Error in parsing the matrix, breaking")
+    break
+  }
+  
+  rownames(newx)[1:3] = c("viallabel","pid","bid")
+  rownames(newx_imp)[1:3] = c("viallabel","pid","bid")
+  
+  #Save the output to the target bucket
+  # Median-MAD normalized TMT ratios
+  local_fname = file.path(local_data_dir, 
+                          paste0("motrpac_pass1b-06_",
+                                 curr_t,"_",curr_ome,
+                                 "_med-mad-normalized-logratio.txt"))
+  message("Write Local: ", local_fname)
+  write.table(newx,
+              file=local_fname,
+              sep="\t",
+              quote=FALSE,
+              row.names = TRUE,
+              col.names = FALSE)
+  if(upload_to_bucket){
+    cmd = paste(gsutil_cmd,"cp",local_fname,out_b)
+    message("Copy to Bucket: ", cmd)
+    system(cmd)    
+  }
+
+  # Median-MAD normalized and imputed TMT ratios
+  local_fname_imp = file.path(local_data_dir,
+                              paste0("motrpac_pass1b-06_",
+                                     curr_t,"_",curr_ome,
+                                     "_med-mad-normalized-imputed-logratio.txt"))
+  message("Write Local: ", local_fname_imp)
+  write.table(newx_imp,
+              file=local_fname_imp,
+              sep="\t",
+              quote=FALSE,
+              row.names = TRUE,
+              col.names = FALSE)
+  if(upload_to_bucket){
+    cmd = paste(gsutil_cmd,"cp",local_fname_imp,out_b)
+    message("Copy to Bucket: ", cmd)
+    system(cmd)
+  }
+
+  #Feature annotations
+  local_fname2 = file.path(local_data_dir, 
+                           paste0("motrpac_pass1b-06_",
+                                  curr_t,"_",curr_ome,
+                                  "_normalized-data-feature-annot.txt"))
+  x_annot = rbind(colnames(x_annot),x_annot)
+  colnames(x_annot) = NULL
+  x_annot = cbind(rownames(x_annot),x_annot)
+  rownames(x_annot) = NULL
+  x_annot[,1] = as.character(x_annot[,1])
+  x_annot[1,1] = "feature_ID"
+  message("Write Local: ", local_fname2)
+  write.table(x_annot,
+              file=local_fname2,
+              sep="\t",
+              quote=FALSE,
+              row.names = FALSE,
+              col.names = FALSE)
+  if(upload_to_bucket){
+    cmd = paste(gsutil_cmd,"cp",local_fname2,out_b)
+    message("Copy to Bucket: ", cmd)
+    system(cmd)
+  }
+}
+```
+
+Save normalized, batch corrected, and protein-corrected data. Only applicable for PTM datasets.
+```{r,eval=TRUE}
+#Perform DEA only on PTM data
+ptm_datasets <- grep("prot-pr",names(proteomics_data),value = T,invert = T)
+
+for(dataset_name in ptm_datasets){
+  
+  #Normalized, batch corrected, and protein corrected
+  x_prot_cor = proteomics_data[[dataset_name]][["norm_filtered"]][["norm_data_b_protein_corrected"]]
+
+  #Get ome and tissue values from dataset name
+  arr = strsplit(dataset_name,split=",")[[1]]
+  curr_ome = tolower(arr[2])
+  curr_t = tolower(arr[1])
+  out_b = paste0(out_bucket,curr_ome,"/data/")
+  
+  #Add bid and pid
+  x_bids = pheno_data$viallabel_data[colnames(x_prot_cor),"bid"]
+  x_pids = pheno_data$viallabel_data[colnames(x_prot_cor),"pid"]
+  newx_prot_cor = x_prot_cor
+  for(j in 1:ncol(newx_prot_cor)){newx_prot_cor[,j] = round(as.numeric(newx_prot_cor[,j]),digits=5)}
+  newx_prot_cor = rbind(x_bids,newx_prot_cor)
+  newx_prot_cor = rbind(x_pids,newx_prot_cor)
+  newx_prot_cor = rbind(colnames(x_prot_cor),newx_prot_cor)
+  colnames(newx_prot_cor) = NULL
+  rownames(newx_prot_cor)[1:3] = c("viallabel","pid","bid")
+  
+  # save the output to the target bucket
+  local_fname = file.path(local_data_dir, 
+                          paste0("motrpac_pass1b-06_",
+                                 curr_t,"_",curr_ome,
+                                 "_med-mad-normalized-protein-corrected-logratio.txt"))
+  message("Write Local: ", local_fname)
+  write.table(newx_prot_cor,
+              file=local_fname,
+              sep="\t",
+              quote=FALSE,
+              row.names = TRUE,
+              col.names = FALSE)
+  if(upload_to_bucket){
+    cmd = paste(gsutil_cmd,"cp",local_fname,out_b)
+    message("Copy to Bucket: ", cmd)
+    system(cmd)
+  }
+}
+```
+

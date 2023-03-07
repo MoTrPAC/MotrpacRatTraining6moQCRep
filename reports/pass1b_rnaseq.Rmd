@@ -1,0 +1,504 @@
+---
+title: 'PASS1B BIC QC report: RNA-seq'
+author: "David Amar"
+date: "06/23/2020"
+output:
+  html_document:
+    df_print: kable
+geometry: margin=2cm
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+library(kableExtra)
+knitr::opts_chunk$set(echo = TRUE)
+
+# configuration of the session: load libraries and functions
+session_packages = c("stats","apeglm","preprocessCore","impute",
+                     "affy","NOISeq","edgeR","caret")
+for (lib_name in session_packages){
+  tryCatch({library(lib_name,character.only = T)}, error = function(e) {
+    print(paste("Cannot load",lib_name,", please install"))
+  })
+}
+```
+
+```{r}
+# Specify the parameters required for the analysis
+# This dir should have the motrpac-bic-norm-qc repo
+repo_local_dir = "~/Desktop/repos/"
+# Runnable command for gsutil
+gsutil_cmd = "~/google-cloud-sdk/bin/gsutil"
+# Where should the data be downloaded to
+local_data_dir = "~/Desktop/MoTrPAC/data/pass_1b/rnaseq/"
+# Bucket structure is: tissue/platform/results/<data files>. For GET, this path should
+# also have a qa_qc directory with the qc_metrics and sample_metadata files.
+bucket = "gs://motrpac-release-data-staging/Results/pass1b-06/transcriptomics/"
+# Specify bucket and local path for the phenotypic data
+# this path is internal to BIC - faster
+# pheno_bucket = "gs://bic_data_analysis/pass1b/pheno_dmaqc/merged2020-06-12/"
+pheno_bucket = "gs://motrpac-internal-release2-results/pass1b-06/phenotype/"
+pheno_local_dir = "~/Desktop/MoTrPAC/data/pass_1b/dmaqc_pheno/"
+# specify parameters for filtering lowly expressed genes and normalization
+# within a tissue keep genes with cpm >= min_cpm in at least min_num_samples samples
+min_cpm = 0.5
+min_num_samples = 2
+norm_method="TMM"
+# Specify how many PCs to examine
+num_pcs = 5
+num_pcs_for_outlier_analysis = 3
+# Specify the significance level for association analysis
+# (e.g., between a PC and a clinical variable)
+p_thr = 0.0001
+```
+
+Specifiy the pipeline, metadata, and sample variables for the analysis.
+
+```{r,eval=T}
+# Define technical and biological variables to be considered in the QC
+pipeline_qc_cols = c("RIN","reads",
+                     "pct_rRNA","pct_globin",
+                     "pct_umi_dup","median_5_3_bias",
+                     "pct_multimapped","pct_GC","pct_chrM")
+biospec_cols = c("registration.sex","key.anirandgroup",
+                 "registration.batchnumber",
+                 "training.staffid",
+                  "is_control",
+                  "vo2.max.test.vo2_max_visit1", # this assumes that visit1's are aligned
+                  "terminal.weight.mg","time_to_freeze",
+                  "timepoint","bid","pid")
+```
+
+```{r,,warning=F,results=F,message=F}
+# load functions and libraries
+source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/unsupervised_normalization_functions.R"))
+source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/gcp_functions.R"))
+source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/qc_report_aux_functions.R"))
+source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/config_session.R"))
+source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/association_analysis_methods.R"))
+```
+
+# Load the data from the buckets
+
+```{r,message=T,warning=T,eval=T}
+# Load the data
+rna_seq_data = parse_rnaseq_data(bucket,local_path=local_data_dir,
+             remove_prev_files = T,GSUTIL_PATH=gsutil_cmd)
+rnaseq_meta = rna_seq_data$sample_metadata
+data_tables = rna_seq_data$data_tables
+
+pheno_data = parse_pheno_data(pheno_bucket,local_path = pheno_local_dir,
+             remove_prev_files = T,GSUTIL_PATH=gsutil_cmd)
+# add a tissue variable (for convinience)
+pheno_data$viallabel_data$tissue = 
+  pheno_data$viallabel_data$specimen.processing.sampletypedescription
+# add the time to freeze variable ((for convinience))
+pheno_data$viallabel_data$time_to_freeze = 
+  pheno_data$viallabel_data$calculated.variables.frozetime_after_train - 
+  pheno_data$viallabel_data$calculated.variables.deathtime_after_train
+# add a binary is_control variable
+pheno_data$viallabel_data$is_control = as.numeric(grepl("control",
+  pheno_data$viallabel_data$key.anirandgroup,ignore.case = T))
+# add the timepoint as a number
+# x - the text description of the group
+get_numeric_timepoint<-function(x){
+  v = rep(0,length(x))
+  tps = c("Eight"=8,"Four"=4)
+  for(tp in names(tps)){
+    v[grepl(paste0(tp,"-week"),x,perl = T,ignore.case = T)] = tps[tp]
+  }
+  return(v)
+}
+pheno_data$viallabel_data$timepoint = get_numeric_timepoint(
+  pheno_data$viallabel_data$key.anirandgroup
+)
+```
+
+# MOP-flagged samples
+
+The RNA-seq pipeline manual of procedures (MOP) defines a flagged sample (e.g., potentially problematic) as a sample that satisfies one of the following: (1) number of read pairs $<20M$, (2) percent GC not in $[20,80]$, (3) percent rRNA reads $>20$, (4) percent of uniquely mapped reads $<60$, (5) RIN $<6$, and (6) percent coding reads + percent utr reads $< 50$. 
+
+```{r,eval=T}
+rnaseq_meta$pipeline_flags =  rnaseq_pipeline_flagged_samples(rnaseq_meta)
+mop_flagged_samples = rownames(rnaseq_meta)[nchar(rnaseq_meta$pipeline_flags)>0]
+```
+
+# Dataset normalization
+
+We first remove unexpressed genes using the min_cpm and min_num_samples parameters. We then use edgeR for library size correction and for TMM normalization. For each dataset (i.e., tissue) we store the normalized data table and all additional variables (e.g., clinical data) in a list called norm_rnaseq_data.
+
+```{r,eval=T,warning=F,message=F}
+norm_rnaseq_data = list()
+for(dataset in names(rna_seq_data$data_tables)){
+  unnorm_counts = rna_seq_data$data_tables[[dataset]]
+  curr_samples = as.character(colnames(unnorm_counts))
+  # For rat data, take samples whose label id starts with "9" - remove qc pools
+  curr_samples = curr_samples[grepl("^9",curr_samples)]
+  unnorm_counts  = unnorm_counts[,curr_samples]
+  
+  # exclude low count genes in the current dataset
+  norm_counts = edgeR_normalized_log_cpm(as.matrix(unnorm_counts),
+      min_cpm = min_cpm,
+      min_num_samples = min_num_samples,
+      norm_method = norm_method
+  )
+
+  # get the dataset metadata
+  curr_meta1 = rnaseq_meta[curr_samples,pipeline_qc_cols]
+  curr_meta2 = pheno_data$viallabel_data[curr_samples,biospec_cols]
+  
+  # get site and tissue
+  curr_sites = paste(unique(rnaseq_meta[curr_samples,"GET_site"]),collapse=",")
+  curr_tissue = paste(unique(pheno_data$viallabel_data[curr_samples,"tissue"],collapse=","))
+  curr_name = paste(curr_sites,curr_tissue,sep=",")
+  if(curr_name %in% names(norm_rnaseq_data)){
+    print(paste("Warning: dataset",curr_name,"appears more than once, taking the last occurrence"))
+  }
+  
+  norm_rnaseq_data[[curr_name]] = list(
+      norm_counts = norm_counts,
+      pipeline_meta = curr_meta1,dmaqc_meta = curr_meta2)
+}
+```
+
+Examine the effect of the normalization process, which includes removing unexpressed genes. For each dataset show the boxplots of 20 randomly selected samples.
+
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=T}
+for(i in 1:length(norm_rnaseq_data)){
+  unnorm_data = data_tables[[i]]
+  norm_data = norm_rnaseq_data[[i]][["norm_counts"]]
+  unnorm_data = log2(unnorm_data+1)
+  samp = sample(1:ncol(norm_data))[1:20]
+  curr_name = names(norm_rnaseq_data)[i]
+  colnames(unnorm_data) = NULL
+  colnames(norm_data) = NULL
+  boxplot(unnorm_data[,samp],
+          main=paste0(curr_name,"\nlog2 raw counts (",nrow(unnorm_counts)," genes)"),
+          ylab = "log2 raw counts",xaxt="n")
+  boxplot(norm_data[,samp],
+          main=paste0(curr_name,"\nnorm log cpm (",nrow(norm_data)," genes)"),
+          ylab = "log2 cpm",xaxt="n")
+}
+```
+
+# PCA visualization (sex and group)
+
+We plot the top two PCs for each tissue, color and shape correspond to randomization group and sex.
+
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=T}
+for(currname in names(norm_rnaseq_data)){
+  # run PCA
+  curr_data = norm_rnaseq_data[[currname]][["norm_counts"]]
+  curr_pca = prcomp(t(curr_data),scale. = T,center = T)
+  curr_pcax = curr_pca$x[,1:num_pcs]
+  explained_var = summary(curr_pca)[["importance"]][3,5]
+  norm_rnaseq_data[[currname]][["pca"]] = list(
+    pcax = curr_pcax,explained_var=explained_var
+  )
+  # plot
+  df = data.frame(
+    PC1 = curr_pcax[,1],PC2 = curr_pcax[,2],
+    randgroup = norm_rnaseq_data[[currname]][["dmaqc_meta"]][,"key.anirandgroup"],
+    sex = as.character(norm_rnaseq_data[[currname]][["dmaqc_meta"]][,"registration.sex"]),
+    stringsAsFactors = F
+  )
+  df$sex[df$sex=="1"] = "F"
+  df$sex[df$sex=="2"] = "M"
+  p = ggplot(df) + 
+      geom_point(aes(x=PC1, y=PC2,col=randgroup, shape=sex)) +
+      ggtitle(currname)
+  plot(p)
+}
+```
+
+# PC-based association analysis
+
+Here we analyze the top principal components (5) in each tissue and compute their association with the selected  variables above (e.g., the pipeline qc metrics). We use Spearman correlation and a linear test for significance. 
+
+For each dataset we also add the correlations among the metadata variables. These two analyses should be interpreted together, as the analyzed variables are not independent.
+
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=T}
+pcs_vs_qc_var_report = c()
+metadata_variable_assoc_report = c()
+for(currname in names(norm_rnaseq_data)){
+  curr_meta = cbind(norm_rnaseq_data[[currname]]$pipeline_meta,
+                     norm_rnaseq_data[[currname]]$dmaqc_meta)
+  # remove the text group description
+  curr_meta = curr_meta[!grepl("randgr",names(curr_meta))]
+  # remove metadata variables with NAs
+  curr_meta = curr_meta[,!apply(is.na(curr_meta),2,any)]
+  # remove bid and pid
+  curr_meta = curr_meta[,!grepl("pid|bid",names(curr_meta))]
+  # remove fields withe zero variance
+  curr_meta = curr_meta[,apply(curr_meta,2,sd)>0]
+  # take the PCA results
+  curr_pcax = norm_rnaseq_data[[currname]][["pca"]][["pcax"]]
+  
+  corrs = cor(curr_pcax,curr_meta,method="spearman")
+  corrsp = pairwise_eval(
+    curr_pcax,curr_meta,func=pairwise_association_wrapper,
+    f=1)
+  
+  # Some ggplots have to be printed to be shown in the notebook
+  print(ggcorrplot(t(corrs),lab=T,lab_size=2.5,hc.order = F) +
+    ggtitle(currname) +
+    theme(plot.title = element_text(hjust = 0.5,size=20)))
+  
+  for(i in 1:nrow(corrsp)){
+    for(j in 1:ncol(corrsp)){
+      if(corrsp[i,j]>p_thr){next}
+      pcs_vs_qc_var_report = rbind(pcs_vs_qc_var_report,
+            c(currname,
+              rownames(corrsp)[i],colnames(corrsp)[j],corrs[i,j],corrsp[i,j])
+            )
+    }
+  }
+  
+  # compute correlations among the metadata variables
+  corrs = cor(curr_meta,method="spearman")
+  corrsp = pairwise_eval(
+    curr_meta,func=pairwise_association_wrapper,
+    f=1)
+  
+  # Some ggplots have to be printed to be shown in the notebook
+  print(ggcorrplot(corrs,lab=T,lab_size=1.5,hc.order = T))
+  
+  for(n1 in rownames(corrsp)){
+    for(n2 in rownames(corrsp)){
+      if(n1==n2){break}
+      if(n1 %in% biospec_cols &&
+         n2 %in% biospec_cols) {next}
+      if(corrsp[n1,n2]>p_thr){next}
+      metadata_variable_assoc_report = rbind(metadata_variable_assoc_report,
+            c(currname,n1,n2,corrs[n1,n2],corrsp[n1,n2])
+            )
+    }
+  }
+}
+# Format the reports - for a nicer presentation in a table
+colnames(metadata_variable_assoc_report) = c(
+  "Dataset(tissue,site)","Var1","Var2","rho(spearman)","p-value")
+colnames(pcs_vs_qc_var_report) = c("Dataset(tissue,site)","PC",
+  "qc_metric","rho(spearman)","p-value")
+pcs_vs_qc_var_report[,5] = format(
+  as.numeric(pcs_vs_qc_var_report[,5]),digits=3)
+pcs_vs_qc_var_report[,4] = format(
+  as.numeric(pcs_vs_qc_var_report[,4]),digits=3)
+metadata_variable_assoc_report[,5] = format(
+  as.numeric(metadata_variable_assoc_report[,5]),digits=3)
+metadata_variable_assoc_report[,4] = format(
+  as.numeric(metadata_variable_assoc_report[,4]),digits=3)
+```
+
+## Print the significant results in tables
+
+```{r,eval=T}
+kable(pcs_vs_qc_var_report,longtable=T,
+      caption = "Correlations between PCs and other variables")  %>%
+  kable_styling(latex_options = c("repeat_header"),font_size = 8)
+
+kable(metadata_variable_assoc_report,longtable=T,
+      caption = "Correlations between metadata variables")%>%
+  kable_styling(latex_options = c("repeat_header"),font_size = 8)
+```
+
+## PCA outliers
+
+In this analysis, outliers are flagged by examining the boxplot of each PC, extending its whiskers to three times the inter-quantile range away from the boxplot. Samples outside this range are then flagged. 
+
+**Note that samples are flagged using an automatic analysis of the principal components. Such analyses may flag samples because of true biological effects and thus further examination is required before determining if flagged samples represent low quality samples. Moreover, note that we plot outliers for the rii (raw intensitied) data as well. Typically, outliers from such datasets will not appear in the bettern normalized ratio data.**
+
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=T}
+pca_outliers_report = c()
+for(currname in names(norm_rnaseq_data)){
+  curr_pcax = curr_pcax = norm_rnaseq_data[[currname]][["pca"]][["pcax"]]
+  
+  # Univariate: use IQRs
+  pca_outliers = c()
+  for(j in 1:num_pcs_for_outlier_analysis){
+    outlier_values <- boxplot.stats(curr_pcax[,j],coef = 3)$out
+    for(outlier in names(outlier_values)){
+      pca_outliers_report = rbind(pca_outliers_report,
+       c(currname,paste("PC",j,sep=""),outlier,
+         format(outlier_values[outlier],digits=5))
+      )
+      if(!is.element(outlier,names(pca_outliers))){
+        pca_outliers[outlier] = outlier_values[outlier]
+      }
+    }
+  }
+  
+  # Plot the outliers
+  if(length(pca_outliers)>0){
+    # print(length(kNN_outliers))
+    df = data.frame(curr_pcax,
+                outliers = rownames(curr_pcax) %in% names(pca_outliers))
+    col = rep("black",nrow(df))
+    col[df$outliers] = "green"
+    plot(df$PC1,df$PC2,pch = as.numeric(df$outliers),col=col,lwd=2,cex=1,
+         main = paste(currname,"\nflagged outliers"),
+         xlab = "PC1",ylab="PC2")
+    plot(df$PC3,df$PC4,pch = as.numeric(df$outliers),col=col,lwd=2,cex=1,
+         main = paste(currname,"\nflagged outliers"),
+         xlab = "PC3",ylab="PC4")
+  }
+}
+if(!is.null(dim(pca_outliers_report))){
+  colnames(pca_outliers_report) =  c("dataset","PC","sample","score")
+}
+
+```
+
+# Sex checks
+
+We verify that the sex of a sample can be predicted from the percent of chromosome Y and percent of chromosome X reads. This is done automatically by training a logistic regression classifier, but we also plot the 2D plot for each tissue.
+
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=T}
+# sex checks - using simple logistic regression classifier (LOO-CV)
+sex_read_info = cbind(rnaseq_meta$pct_chrX,rnaseq_meta$pct_chrY)
+rownames(sex_read_info) = rownames(rnaseq_meta)
+sex_check_outliers = c()
+for(currname in names(norm_rnaseq_data)){
+  # 1 is female
+  curr_sex = norm_rnaseq_data[[currname]]$dmaqc_meta$registration.sex
+  read_info = sex_read_info[
+    rownames(norm_rnaseq_data[[currname]]$dmaqc_meta),]
+  df = data.frame(sex = as.character(curr_sex),
+                  pct_chrX = read_info[,1],
+                  pct_chrY = read_info[,2],stringsAsFactors = F)
+  df$sex[df$sex=="1"] = "F"
+  df$sex[df$sex=="2"] = "M"
+  if(length(table(df$sex))==1){
+    print(paste("Cannot run sex check in dataset:",currname))
+    print("There are no data points from both classes, skipping")
+    next
+  }
+  df = df[!apply(is.na(df[,1:2]),1,any),]
+  if(nrow(df)<5){
+    print(paste("Cannot run sex check in dataset:",currname))
+    print("Too many missing values in pct_chrY and pct_chrX, skipping")
+    next
+  }
+  
+  p = ggplot(df) + 
+      geom_point(aes(x=pct_chrX, y=pct_chrY,col=sex, shape=sex)) +
+      ggtitle(paste0(currname," - sex check"))
+  plot(p)
+  
+  train_control <- trainControl(method = "cv", number = nrow(df),
+                                savePredictions = TRUE)
+  # train the model on training set
+  model <- train(sex ~ .,data = df,
+               trControl = train_control,
+               method = "glm", family=binomial(link="logit"))
+  # CV redults
+  cv_res = model$pred
+  cv_errors = cv_res[,1] != cv_res[,2]
+  err_samples = rownames(df)[cv_res[cv_errors,"rowIndex"]]
+  for(samp in err_samples){
+    sex_check_outliers = rbind(sex_check_outliers,
+                               c(currname,samp))
+  }
+}
+if(! is.null(dim(sex_check_outliers))){
+  colnames(sex_check_outliers) = c("dataset","sample")
+}
+```
+
+# Print all flagged samples
+
+```{r,eval=T}
+# add the dataset name to mop outliers
+sample2dataset = paste(tolower(rnaseq_meta[,c("Tissue")]),
+        tolower(rnaseq_meta[,c("GET_site")]),sep=",")
+names(sample2dataset) = rownames(rnaseq_meta)
+
+all_flagged = NULL
+if(length(pca_outliers_report)>0){
+  all_flagged = union(all_flagged,pca_outliers_report[,"sample"])
+}
+if(length(sex_check_outliers)>0){
+  all_flagged = union(all_flagged,sex_check_outliers[,"sample"])
+}
+all_flagged = union(all_flagged,mop_flagged_samples)
+
+flagged_sample_report = c()
+for(samp in all_flagged){
+  samp_dataset = sample2dataset[samp]
+  samp_metric = NULL
+  if(samp %in% mop_flagged_samples){
+    samp_metric = rnaseq_meta[samp,"pipeline_flags"]
+  }
+  if(!is.null(dim(sex_check_outliers)) &&
+     samp %in% sex_check_outliers[,"sample"]){
+    samp_metric = c(samp_metric,"Sex-flagged")
+  }
+  if(!is.null(dim(pca_outliers_report)) &&
+     samp %in% pca_outliers_report[,"sample"]){
+    curr_pcs = pca_outliers_report[pca_outliers_report[,"sample"]==samp,"PC"]
+    samp_metric = c(samp_metric,curr_pcs)
+  }
+  flagged_sample_report = rbind(flagged_sample_report,
+      c(samp,samp_dataset,paste(samp_metric,collapse=","))
+  )
+}
+colnames(flagged_sample_report) = c("Viallabel","Dataset","Methods")
+kable(flagged_sample_report,longtable=T,
+      caption = "Outliers detected, MOP, Sex check, and by tissue PCA data")%>%
+  kable_styling(font_size = 8,latex_options = c("hold_position", "repeat_header"))
+
+```
+
+## Save the results in the bucket
+
+```{r,eval=T}
+# use the raw bucket names as the output location
+# (implied assumption: rna_seq_data and norm_rnaseq_data have the same order)
+get_out_bucket_from_local_file_name<-function(b,input_bucket,shift_size=3){
+  arr = strsplit(b,split="/")[[1]]
+  n = length(arr)
+  local_b = paste(arr[(n-shift_size):(n-1)],collapse="/")
+  out_bucket = paste0(input_bucket,"/",local_b,"/")
+  out_bucket = gsub("//","/",out_bucket)
+  out_bucket = gsub("gs:/+","gs://",out_bucket)
+  return(out_bucket)
+}
+out_buckets = sapply(rna_seq_data$data_table_paths,
+    get_out_bucket_from_local_file_name,input_bucket=bucket)
+for(i in 1:length(norm_rnaseq_data)){
+  out_b = out_buckets[i]
+  x = norm_rnaseq_data[[i]]$norm_counts
+  x_bids = pheno_data$viallabel_data[colnames(x),"bid"]
+  x_pids = pheno_data$viallabel_data[colnames(x),"pid"]
+  newx = cbind(rownames(x),x)
+  rownames(newx) = NULL
+  for(j in 2:ncol(newx)){
+    newx[,j] = round(as.numeric(newx[,j]),digits=5)
+  }
+  colnames(newx)[1] = "geneid"
+  newx = rbind(c("bid",x_bids),newx)
+  newx = rbind(c("pid",x_pids),newx)
+  newx = rbind(c("viallabel",colnames(x)),newx)
+  colnames(newx) = NULL
+  
+  # a simple sanity check
+  m = newx[-c(1:3),-1]
+  mode(m) = "numeric"
+  if(!all(abs(m-x)< 1e-05)){
+    print("Error in parsing the matrix, breaking")
+    break
+  }
+  
+  # save the output to the target bucket
+  curr_t = names(rna_seq_data$data_tables)[i]
+  curr_t = tolower(gsub("_","-",curr_t))
+  local_fname = paste0(local_data_dir,
+                       "motrpac_pass1b-06_",curr_t,"_transcript-rna-seq_",
+                       "normalized-log-cpm.txt")
+  fwrite(newx,file=local_fname,sep="\t",quote=F,
+         row.names = F,col.names = F)
+  cmd = paste(gsutil_cmd,"cp",local_fname,out_b)
+  system(cmd)
+}
+```
+
