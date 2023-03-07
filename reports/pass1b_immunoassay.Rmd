@@ -15,10 +15,17 @@ library(ggrepel)
 library(pheatmap)
 library(impute)
 knitr::opts_chunk$set(echo = TRUE)
-knitr::opts_knit$set(root.dir = '/oak/stanford/groups/smontgom/nicolerg/MOTRPAC/MAWG_DATA/shared/pass1b-06/immunoassay')
-repo_dir = "/oak/stanford/groups/smontgom/nicolerg/src/MOTRPAC"
-tmp_dir = "/oak/stanford/groups/smontgom/nicolerg/tmp"
-source(paste0(repo_dir,"/motrpac-bic-norm-qc/tools/gcp_functions.R"))
+# Set the desired working directory
+knitr::opts_knit$set(root.dir = "ADDPATH")
+
+# This directory should have the MotrpacRatTraining6moQCRep repository
+# clone from: https://github.com/MoTrPAC/MotrpacRatTraining6moQCRep
+repo_dir = '~/Desktop/repos'
+
+# set a tmp dir for downloading the data
+tmpdir = "ADDPATH"
+
+source(paste0(repo_dir,"/tools/gcp_functions.R"))
 ```
 
 ## Load the data from the buckets
