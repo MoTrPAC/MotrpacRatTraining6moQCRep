@@ -1,0 +1,581 @@
+---
+title: "PASS1B BIC QC Report: Immunoassay"
+author: "Shruti Marwaha, Nicole Gay"
+date: "6/24/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(data.table)
+library(MotrpacBicQC)
+library(testit)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(impute)
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = '/oak/stanford/groups/smontgom/nicolerg/MOTRPAC/MAWG_DATA/shared/pass1b-06/immunoassay')
+repo_dir = "/oak/stanford/groups/smontgom/nicolerg/src/MOTRPAC"
+tmp_dir = "/oak/stanford/groups/smontgom/nicolerg/tmp"
+source(paste0(repo_dir,"/motrpac-bic-norm-qc/tools/gcp_functions.R"))
+```
+
+## Load the data from the buckets
+```{r Load the data }
+gcp_bucket = "gs://my-project-transfer-stanford/immunoassay/rat/batch1_20210215"
+bead_counts = dl_read_gcp(sprintf("%s/bead_counts/pass1b-06_immunoassay_bead-counts.txt", gcp_bucket), 
+                          OUTDIR=tmp_dir, sep = "\t")
+metadata = dl_read_gcp(sprintf("%s/sample_metadata_20210803.csv", gcp_bucket), 
+                          OUTDIR=tmp_dir, sep = ",")
+
+# name of different panels
+unique(bead_counts[,panel_name])
+
+mfi_list = list()
+for(mfi_file in system(sprintf("gsutil ls %s/mfi/", gcp_bucket), intern=T)){
+  mfi = dl_read_gcp(mfi_file, OUTDIR=tmp_dir, sep='\t')
+  panel = gsub(".*_mfi_|\\.txt", "", mfi_file) 
+  mfi_list[[panel]] = mfi
+  writeLines(panel)
+}
+```
+
+## Failed measurements with low bead count 
+```{r bead count}
+# all of MoTrPAC samples' vial labels start with 90, rest are reference samples or standards.
+metadata_experiment_samples = metadata[grepl("^90",vial_label)]
+metadata_experiment_samples[,group := ifelse(intervention=='control', 'control', sacrifice_time)]
+
+bead_counts_experiment_samples = bead_counts[grepl("^90",vial_label) & !grepl("CHEX[1,2,3]",feature_ID)]
+bead_counts_metadata = merge(bead_counts_experiment_samples, metadata_experiment_samples,
+                             by=c('vial_label','plate_id','luminex_sample_name','panel_name'))
+
+flagged = bead_counts_metadata[bead_count < 20]
+dim(flagged)
+
+cat("flagged: low bead count:\n")
+table(flagged[,panel_name],flagged[,tissue_code])
+cat("\ntotal:\n")
+table(bead_counts_metadata[,panel_name],bead_counts_metadata[,tissue_code])
+flagged_table = data.table(table(flagged[,panel_name],flagged[,tissue_code]))
+# 152 out of 840 (18%) t61-colon measurements (including CHEX4) in rat-mag27plex have a low bead count.
+
+ggplot(flagged_table, aes(x=V1, y=N, fill=V2)) +
+  geom_bar(stat = 'identity', colour='black') +
+  theme_classic() +
+  scale_fill_manual(values=tissue_cols) +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.5, colour='black')) +
+  labs(x='LUMINEX panel', y='N flagged wells', fill='Tissue', title='Number of wells with bead count < 20') 
+```
+
+## Preprocess MFI  
+- log2-transform raw MFI  
+- flag any CHEX4 > 100  
+- merge with metadata  
+```{r preprocess MFI data}
+pre_process_mfi = function(mfi_dt, metadata){
+  mfi_experiment_samples = mfi_dt[grepl("^90",vial_label)]
+  mfi_experiment_samples[,c("CHEX1", "CHEX2", "CHEX3") := NULL]
+
+  # take log2 of mfi values before merging
+  metadata_cols = c('vial_label','plate_id','luminex_sample_name','panel_name')
+  to_log = colnames(mfi_experiment_samples)[!colnames(mfi_experiment_samples) %in% metadata_cols]
+  mfi_experiment_samples[, (to_log) := lapply(.SD, log), .SDcols=to_log]
+  
+  # merge with metadata
+  mfi_meta = merge(metadata, mfi_experiment_samples, by=c('panel_name','plate_id','luminex_sample_name','vial_label'))
+  assert(nrow(mfi_meta) == nrow(mfi_experiment_samples))
+
+  # flag any CHEX4 values > 100
+  flagged = mfi_meta[CHEX4 > log2(100)]
+  if(nrow(flagged)>0){
+    cat("flagged: CHEX4 values > 100:\n")
+    print(flagged[,c(metadata_cols, 'tissue_code'), with=F])
+  }
+  
+  return(mfi_meta)
+}
+
+processed_mfi_list = list()
+for(panel in names(mfi_list)){
+  writeLines(panel)
+  mfi = mfi_list[[panel]]
+  processed_mfi_list[[panel]] = pre_process_mfi(mfi, metadata_experiment_samples)
+}
+```
+
+## Correlate analytes measured on multiple panels 
+```{r correlation between different panels for the same analyte}
+#proteins measured by more than 1 panel
+LEPTIN <- c("rat-mag27plex", "rat-metabolic")
+MCP1 <- c("rat-mag27plex", "rat-metabolic")
+IL6 <- c("rat-mag27plex", "rat-metabolic", "rat-myokine")
+FRACTALKINE <- c("rat-mag27plex", "rat-myokine")
+BDNF <- c("rat-pituitary", "rat-myokine")
+
+common_analytes <- list(LEPTIN,IL6,MCP1,FRACTALKINE,BDNF)
+names(common_analytes) <- c("LEPTIN","IL6","MCP1","FRACTALKINE","BDNF")
+
+combine_diff_assays <- function(list_name, assay_name1, assay_name2, analyte){
+  combined_assays <- merge(list_name[[assay_name1]], 
+                           list_name[[assay_name2]][,c("vial_label","tissue_code","group",analyte),with=F], 
+                           by=c('vial_label','tissue_code','group'), 
+                           suffixes=c( paste("",assay_name1,sep="_"), paste("",assay_name2,sep="_")))
+  combined_assays_sorted <- combined_assays[order(tissue_code, group)]
+  
+  return(combined_assays_sorted)
+}
+
+# find correlation for a a given analyte from two different assays (from common tissues)
+find_corr <- function(list_name, assay_name1, assay_name2, analyte){
+  combined_assay <- combine_diff_assays(list_name, assay_name1, assay_name2, analyte)
+  
+  analyte_range <- range(c(combined_assay[,get(paste(analyte,assay_name1,sep="_"))],
+                           combined_assay[,get(paste(analyte,assay_name2,sep="_"))]), na.rm=T) # try using finite=F
+  analyte_range[1] <- floor(analyte_range[1])
+  analyte_range[2] <- ceiling(analyte_range[2])
+  
+  correlation = cor(combined_assay[,get(paste(analyte,assay_name1,sep="_"))], 
+                    combined_assay[,get(paste(analyte,assay_name2,sep="_"))],method="sp",use="complete.obs")
+  print(correlation)
+  
+  p <- ggplot(combined_assay, aes(x=get(paste(analyte,assay_name1,sep="_")),
+                                  y=get(paste(analyte,assay_name2,sep="_")), 
+                                  col=tissue_code, 
+                                  shape=group)) +
+    geom_point() + 
+    geom_abline() + 
+    coord_fixed(xlim=analyte_range, ylim=analyte_range) +
+    labs(x = assay_name1, y = assay_name2, title = paste(analyte,format(correlation,digits=2))) + 
+    scale_color_manual(values=tissue_cols) + 
+    theme_bw()
+  print(p)
+}
+
+for(analyte in 1:length(common_analytes))
+{
+  print(names(common_analytes)[[analyte]])
+  l <- length(common_analytes[[analyte]])
+
+  for(i in 1:(l-1))
+  {
+    for(j in (i+1):l)
+    {
+      print(c(common_analytes[[analyte]][i],common_analytes[[analyte]][j]))
+      find_corr(processed_mfi_list,common_analytes[[analyte]][i],common_analytes[[analyte]][j],names(common_analytes)[[analyte]])
+    }
+  }
+  cat("\n")
+}
+```
+
+## PCA
+```{r PCA analysis}
+replace_missing <- function(x){
+  x[is.na(x)] = mean(x, na.rm=T)
+  return(x)
+}
+
+calculate_pca <- function(list_name, assay_name){
+  # everything before and including "group"
+  dt = copy(list_name[[assay_name]])
+  non_mfi_cols = colnames(dt)[1:which(colnames(dt)=='group')]
+  dt[,c(non_mfi_cols, 'CHEX4') := NULL]
+  # set missing values to mean 
+  dt = dt[,lapply(.SD, replace_missing)]
+  
+  pca = prcomp(dt, scale.=T, center=T)
+  if(dim(pca$x)[2] < 2){
+    message(sprintf("Panel %s does not have enough analytes to plot 2 PCs.", assay_name))
+    return()
+  }
+  df = data.frame(
+    PC1 = pca$x[,1],PC2 = pca$x[,2],
+    group = list_name[[assay_name]][,group],
+    sex = list_name[[assay_name]][,sex],
+    tissue = list_name[[assay_name]][,tissue_code],
+    stringsAsFactors = F
+  )
+  p = ggplot(df) + 
+    geom_point(aes(x=PC1, y=PC2,col=tissue, shape=group),size=3) +
+    scale_color_manual(values=tissue_cols) + 
+    ggtitle(assay_name) +
+    theme_bw()
+  plot(p)
+}
+
+for(panel in names(processed_mfi_list)){
+  print(panel)
+  calculate_pca(processed_mfi_list, panel)
+}
+```
+
+```{r pca each tissue, out.width="50%", out.height="50%"}
+# PCA for each tissue
+calculate_pca_tissue <- function(list_name, assay_name){
+  tissues <- unique(list_name[[assay_name]][,tissue_code])
+
+  for(t in tissues)
+  {
+    dt_tissue = list_name[[assay_name]][tissue_code==t]
+    mfi_cols = colnames(dt_tissue)[(which(colnames(dt_tissue)=='group')+1):ncol(dt_tissue)]
+    mfi_cols = mfi_cols[!mfi_cols == 'CHEX4']
+    # set missing values to mean 
+    dt_tissue = dt_tissue[,(mfi_cols) := lapply(.SD, replace_missing), .SDcols = mfi_cols]
+    
+    if(length(mfi_cols) < 3){
+      message(sprintf("Panel %s does not have enough analytes to plot 2 PCs.", assay_name))
+      return()
+    }
+    
+    pca = prcomp(dt_tissue[,mfi_cols,with=F], scale.=T, center=T)
+    df = data.frame(
+      PC1 = pca$x[,1],PC2 = pca$x[,2],
+      group = dt_tissue[,"group"],
+      sex = dt_tissue[,"sex"],
+      tissue = dt_tissue[,"tissue_code"],
+      stringsAsFactors = F
+    )
+    p = ggplot(df) + 
+      geom_point(aes(x=PC1, y=PC2,fill=group, shape=sex),size=3, colour='black') +
+      scale_fill_manual(values=group_cols) + 
+      labs(title=assay_name, subtitle=t) +
+      theme_classic() +
+      guides(fill=guide_legend(override.aes = list(shape=21))) +
+      scale_shape_manual(values=c(female=21, male=24))
+    plot(p)
+  }
+}
+
+for(panel in names(processed_mfi_list)){
+  calculate_pca_tissue(processed_mfi_list, panel)
+}
+```
+
+## Impute missing values 
+Missing values are due to bead counts < 20, which is not correlated with actual analyte abundance.  
+```{r massage}
+# first get data into slightly different format
+name_to_vl = unique(metadata[,.(vial_label, luminex_sample_name, tissue_code, bid, sex, intervention, sacrifice_time)])
+# remove reference standards from this step. they are in duplicate so it's hard to merge them with the other data
+name_to_vl = name_to_vl[!grepl("^8", vial_label)]
+name_to_vl[, group := ifelse(intervention=='control','control',sacrifice_time)]
+name_to_vl[,c('intervention','sacrifice_time'):=NULL]
+
+data_list = list()
+for(panel in names(mfi_list)){
+  mfi = copy(mfi_list[[panel]])
+  
+  need_to_remove = c("CHEX1", "CHEX2", "CHEX3")
+  mfi[,(need_to_remove) := NULL]
+  # merge with viallabel
+  # this removes standard curve, background, and ref stds 
+  p = merge(name_to_vl, mfi, by=c("vial_label", "luminex_sample_name"))
+  
+  # split metadata and intensities
+  meta = p[,.(bid, vial_label, luminex_sample_name, tissue_code, panel_name, plate_id, sex, group, CHEX4)]
+  mfi = p
+  mfi[,c("tissue_code", "plate_id", "panel_name", "CHEX4", "sex", "group", "bid") := NULL]
+  
+  # convert to data.frame for portability
+  mfi = as.data.frame(mfi, check.names=F)
+  meta = data.frame(meta, stringsAsFactors=F)
+  if(any(duplicated(mfi$vial_label))){
+    stop(sprintf("Duplicate vial labels: %s, %s", panel, unique(meta$tissue_code[duplicated(meta$vial_label)])))
+  }
+  rownames(mfi) = mfi$vial_label
+  mfi$luminex_sample_name = NULL
+  mfi$vial_label = NULL
+  rownames(meta) = meta$vial_label
+  
+  # MFI and meta$CHEX4 should be log2-transformed before differential analysis
+  mfi = data.frame(lapply(mfi, function(x) log2(as.numeric(x))),check.names=F, row.names = rownames(mfi))
+  meta$log2_CHEX4 = log2(as.numeric(meta$CHEX4))
+  
+  # differential analysis should be performed independently for each tissue. these data frames include all tissues for an assay 
+  data_list[[panel]] = list(log2_mfi=mfi,
+                            metadata=meta)
+  
+}
+```
+
+For each tissue within each panel:   
+- Remove samples with >50% missing values (i.e. bead counts < 20)  
+- Remove features where 2 or more values for a single group are NA  
+- Impute missing values with KNN  
+```{r impute, out.width="50%", out.height="50%"}
+imputed_data = list()
+removed_samples = list()
+i=1
+for(panel in names(data_list)){
+  
+  data = data_list[[panel]]$log2_mfi
+  data$dummy = 1 # can't figure out how to return a df when subsetting rows of a df with a single col
+  meta = data.table(data_list[[panel]]$metadata)
+  
+  imputed_data[[panel]] = list()
+  
+  for(tissue in unique(meta[,tissue_code])){
+    
+    filtered=F
+    imputed_data[[panel]][[tissue]] = list()
+    
+    curr_meta = meta[tissue_code==tissue]
+    curr_meta[,group := factor(group, levels=c('control','1w','2w','4w','8w'))]
+    curr_meta = curr_meta[order(sex, group)] # sort
+    curr_data = data[as.character(curr_meta[,vial_label]),] # subset data
+    curr_data$dummy = NULL
+    
+    n_missing = sum(apply(curr_data, c(1,2), is.na))
+    writeLines(sprintf("N missing in %s %s: %s", panel, tissue, n_missing))
+    
+    if(n_missing == 0){
+      imputed_data[[panel]][[tissue]]$mfi_log2_filt_imputed = curr_data
+      new_meta = as.data.frame(curr_meta, row.names=curr_meta[,vial_label]) # why isn't row.names working?
+      rownames(new_meta) = new_meta$vial_label
+      imputed_data[[panel]][[tissue]]$metadata = new_meta
+      next
+    }
+    
+    meta_df = data.frame(curr_meta[,.(vial_label, sex, group)])
+    rownames(meta_df) = meta_df$vial_label
+    meta_df$vial_label = NULL
+    colors = list(sex = sex_cols[names(sex_cols) %in% meta_df$sex], 
+                  group = group_cols[names(group_cols) %in% meta_df$group])
+    
+    pheatmap(t(curr_data),
+             cluster_rows=F,
+             cluster_cols=F,
+             scale='row',
+             na_col = 'black',
+             main = sprintf('%s %s with missing values', panel, tissue),
+             annotation_col = meta_df,
+             annotation_colors = colors)
+    
+    # exclude samples with more than 50% missing values
+    bin_missing = is.na(curr_data)
+    fraction_missing = rowSums(bin_missing)/ncol(bin_missing)
+    need_to_remove = names(fraction_missing)[fraction_missing > 0.5]
+    if(length(need_to_remove) > 0){
+      # writeLines(sprintf("The following samples in %s %s have more than 50%% missing values and will be removed: %s",
+      #                    panel, tissue, paste0(need_to_remove, collapse=', ')))
+      missing_dt = curr_meta[vial_label %in% need_to_remove, .(vial_label, tissue_code, panel_name)]
+      missing_dt[,fraction_missing := fraction_missing[match(missing_dt[,vial_label], names(fraction_missing))]]
+      removed_samples[[i]] = missing_dt
+      i=i+1
+      curr_data = curr_data[!rownames(curr_data) %in% need_to_remove,]
+      curr_meta = curr_meta[!vial_label %in% need_to_remove]
+      filtered=T
+    }
+    
+    # exclude features where more than 2 values for a single group are NA 
+    data_melt = reshape2::melt(as.matrix(curr_data))
+    colnames(data_melt) =  c('vial_label','feature_ID','value')
+    missing_data = data_melt[is.na(data_melt$value),]
+    # merge with meta
+    missing_data = data.table(merge(missing_data, curr_meta[,.(vial_label, sex, group)], by='vial_label'))
+    # for a given feature, are there more than 2 missing values from a single group?
+    missing_data[,sex_group := paste0(sex, '_', group)]
+    sums = missing_data[,list(n_missing_per_group = sum(is.na(value))),
+                 by=.(feature_ID, sex_group)]
+    dont_impute = as.character(unique(sums[n_missing_per_group > 1, feature_ID]))
+    if(length(dont_impute) > 0){
+      sums2 = missing_data[feature_ID %in% dont_impute,list(n_missing = sum(is.na(value))),
+                   by=.(feature_ID)]
+      # remove these features from the data entirely since this affects so few features and would otherwise complicate downstream analyses to conditionally impute values 
+      curr_data[,dont_impute] = NULL
+      writeLines(sprintf("The following features in %s %s have more than one missing value for at least one sex_group and are being excluded: %s", panel, tissue, paste0(dont_impute, collapse=', ')))
+      sums = sums[order(n_missing_per_group, decreasing=T)]
+      print(sums[feature_ID %in% dont_impute])
+      filtered=T
+    }
+    
+    if(filtered){
+        pheatmap(t(curr_data),
+           cluster_rows=F,
+           cluster_cols=F,
+           scale='row',
+           na_col = 'black',
+           main = sprintf('%s %s with missing values, filtered', panel, tissue),
+           annotation_col = meta_df,
+           annotation_colors = colors)
+    }
+
+    # impute with KNN
+    k = 5
+    
+    meta_df = data.frame(curr_meta[,.(vial_label, sex, group)])
+    rownames(meta_df) = meta_df$vial_label
+    meta_df$vial_label = NULL
+    colors = list(sex = sex_cols[names(sex_cols) %in% meta_df$sex], 
+                  group = group_cols[names(group_cols) %in% meta_df$group])
+    
+    imputed = impute.knn(as.matrix(curr_data), k=k, rowmax=0.3, colmax=0.5) # analyte x sample
+    pheatmap(t(imputed$data),
+             cluster_rows=F,
+             cluster_cols=F,
+             scale='row',
+             na_col = 'black',
+             main = sprintf('%s %s filtered and imputed (k=%s)', panel, tissue, k),
+             annotation_col = meta_df,
+             annotation_colors = colors)
+    
+    # replace data
+    imputed_data[[panel]][[tissue]]$mfi_log2_filt_imputed = as.data.frame(imputed$data)
+    new_meta = as.data.frame(curr_meta, row.names=curr_meta[,vial_label]) # why isn't row.names working?
+    rownames(new_meta) = new_meta$vial_label
+    imputed_data[[panel]][[tissue]]$metadata = new_meta
+    
+  }
+}
+removed_samples = rbindlist(removed_samples)
+writeLines("Samples removed due to >50% missing values:")
+removed_samples
+```
+
+## Identify analyte-specific outliers  
+Here we define outliers as samples with a measurement more than 4 standard deviations from the mean for a specific panel, tissue, and analyte. Replace outliers with NA for differential analysis.  
+```{r id outliers, warning=F}
+outlier_report_list = list()
+i=1
+for(panel in names(imputed_data)){
+  for(tissue in names(imputed_data[[panel]])){
+    meta = imputed_data[[panel]][[tissue]]$metadata
+    mfi = imputed_data[[panel]][[tissue]]$mfi_log2_filt_imputed
+    mfi_outliers_removed = copy(mfi)
+    # for each analyte, check for outliers 
+    for(analyte in colnames(mfi)){
+      curr_mfi = mfi[analyte]
+      curr_data = merge(curr_mfi, meta, by="row.names")
+      assert(nrow(curr_data) == nrow(curr_mfi))
+
+      values = curr_data[,analyte]
+      names(values) = curr_data$vial_label
+      
+      # are any values outside of 3 sd of the mean?
+      curr_mean = mean(values, na.rm=T)
+      curr_sd = sd(values, na.rm=T)
+      zscores = unlist(lapply(values, function(x){
+        (x-curr_mean)/curr_sd
+      }))
+      zscore_outliers = zscores[abs(zscores) > 4]
+      if(length(zscore_outliers) > 0){
+        outlier_report_list[[i]] = data.table(viallabel = names(zscore_outliers),
+                                              panel = panel, 
+                                              tissue_code = tissue,
+                                              feature_ID = analyte, 
+                                              zscore = unname(zscore_outliers))
+        # replace outliers with NA
+        for(v in names(zscore_outliers)){
+          mfi_outliers_removed[v, analyte] = NA_real_
+        }
+        
+        i = i+1
+      }
+    }
+    # save table with outliers removed 
+    imputed_data[[panel]][[tissue]]$mfi_log2_filt_imputed_na_outliers = mfi_outliers_removed
+  }
+}
+
+outlier_report = rbindlist(outlier_report_list)
+outlier_report
+```
+
+```{r plot outliers}
+# one plot per data set
+for(panel in names(imputed_data)){
+  for(tissue in names(imputed_data[[panel]])){
+    meta = imputed_data[[panel]][[tissue]]$metadata
+    mfi = imputed_data[[panel]][[tissue]]$mfi_log2_filt_imputed
+    mfi = reshape2::melt(as.matrix(mfi))
+    colnames(mfi) = c('vial_label','feature_ID','value')
+    curr_data = merge(mfi, meta, by="vial_label")
+    curr_data = merge(curr_data, outlier_report, 
+                      by.x = c('vial_label','panel_name','tissue_code','feature_ID'),
+                      by.y = c('viallabel','panel','tissue_code','feature_ID'),
+                      all.x=T)
+    curr_data$is_outlier = ifelse(is.na(curr_data$zscore), 'none', 'z')
+    
+    label_data = curr_data[curr_data$is_outlier == 'z',]
+
+    # make a boxplot of all values across analytes, highlighting outliers 
+    g = ggplot(curr_data, aes(x=feature_ID, y=value)) +
+      geom_boxplot(outlier.shape=NA) +
+      geom_point(data = curr_data[curr_data$is_outlier == 'z',],
+               colour='red', aes(fill=group, shape=sex), size=2) +
+      geom_point(data = curr_data[curr_data$is_outlier == 'none',],
+                 position=position_jitter(width = 0.2, height = 0), 
+                 aes(fill=group, shape=sex),size=1) +
+      theme_classic() +
+      theme(axis.text.x = element_text(angle=90, vjust=0.5, hjust=1, colour='black'),
+            axis.title.x = element_blank()) +
+      scale_fill_manual(values=group_cols) +
+      scale_shape_manual(values=c(female=21, male=24)) +
+      labs(title=sprintf("%s %s", panel, tissue)) +
+      geom_text_repel(data=label_data, aes(label=bid), hjust=0, vjust=0.5, size=2, direction='y') +
+      guides(fill=guide_legend(override.aes = list(shape=21, size=1.5)),
+             shape=guide_legend(override.aes = list(colour='black', size=1.5)))
+    print(g)
+  }
+}
+```
+
+```{r write out submitted and processed data}
+for(panel in names(imputed_data)){
+  
+  ## submitted mfi
+  # write one file per tissue 
+  all_mfi = copy(mfi_list[[panel]])
+  all_mfi[,tissue_code := sapply(vial_label, function(x){
+    splits = unname(unlist(strsplit(as.character(x), "")))
+    tissue_code = paste0(splits[8:9], collapse='')
+    if(tissue_code=="NANA"){return(NA_character_)}
+    return(paste0("T",tissue_code))
+  })]
+  for(t in unique(all_mfi[,tissue_code])){
+    if(is.na(t)){next}
+    tissue_name = bic_animal_tissue_code$tissue_name_release[bic_animal_tissue_code$bic_tissue_code==t]
+    # subset
+    curr_mfi = all_mfi[tissue_code==t]
+    curr_mfi[,c("panel_name","plate_id","luminex_sample_name","tissue_code") := NULL]
+    # write 
+    write.table(curr_mfi, file=sprintf("pass1b-06_%s_immunoassay_%s_mfi.txt", tissue_name, panel), 
+                sep='\t', col.names=T, row.names=F, quote=F)
+  }
+  
+
+  all = imputed_data[[panel]]
+  for(tissue in names(all)){
+    
+    ## get CHEX
+    chex = mfi_list[[panel]][,.(vial_label, CHEX1, CHEX2, CHEX3, CHEX4)]
+    chex_cols = c('CHEX1','CHEX2','CHEX3','CHEX4')
+    chex[,(chex_cols) := lapply(.SD, log2), .SDcols = chex_cols]
+    
+    ## mfi_log2_filt_imputed
+    curr = copy(all[[tissue]]$mfi_log2_filt_imputed)
+    curr = cbind(vial_label=rownames(curr), curr)
+    curr_chex = merge(curr, chex, by='vial_label')
+    assert(nrow(curr_chex) == nrow(curr))
+    write.table(curr_chex, file=sprintf("pass1b-06_%s_immunoassay_%s_mfi-log2-filt-imputed.txt", tissue, panel), 
+                sep='\t', col.names=T, row.names=F, quote=F)
+    
+    ## mfi_log2_filt_imputed_na_outliers
+    curr = copy(all[[tissue]]$mfi_log2_filt_imputed_na_outliers)
+    curr = cbind(vial_label=rownames(curr), curr)
+    curr_chex = merge(curr, chex, by='vial_label')
+    assert(nrow(curr_chex) == nrow(curr))
+    write.table(curr_chex, file=sprintf("pass1b-06_%s_immunoassay_%s_mfi-log2-filt-imputed-na-outliers.txt", tissue, panel), 
+                sep='\t', col.names=T, row.names=F, quote=F)
+  }
+}
+
+# copy to MAWG bucket 
+system("gsutil -m cp *txt gs://my-bucket/pass1b-06/immunoassay/data/release/")
+
+# TODO
+# copy to internal release bucket 
+# this should include sample_metadata and all files generated by this script 
+```

@@ -1,0 +1,642 @@
+---
+title: 'PASS1B BIC QC report: ATAC-seq'
+author: "David Amar, Nicole Gay"
+date: "5/10/2021"
+output:
+  html_document:
+    df_print: kable
+geometry: margin=2cm
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+library(kableExtra)
+knitr::opts_chunk$set(echo = TRUE)
+
+# Set the desired working directory
+knitr::opts_knit$set(root.dir = "ADDPATH")
+
+# This directory should have the MotrpacRatTraining6moQCRep repository
+# clone from: https://github.com/MoTrPAC/MotrpacRatTraining6moQCRep
+repo_dir = '~/Desktop/repos'
+
+# configuration of the session: load libraries and functions
+session_packages = c("stats","apeglm","preprocessCore","impute",
+                     "affy","NOISeq","edgeR","caret","limma","MotrpacBicQC",
+                     "data.table","ChIPseeker","GenomicFeatures","RMariaDB")
+for (lib_name in session_packages){
+  tryCatch({library(lib_name,character.only = T)}, error = function(e) {
+    print(paste("Cannot load",lib_name,", please install"))
+  })
+}
+```
+
+```{r,source fx,warning=F,results=F,message=F}
+# load functions and libraries
+# This directory should have the MotrpacRatTraining6moQCRep repository
+# clone from: https://github.com/MoTrPAC/MotrpacRatTraining6moQCRep
+repo_dir = '~/Desktop/repos'
+source(paste0(repo_dir,"/tools/unsupervised_normalization_functions.R"))
+source(paste0(repo_dir,"/tools/gcp_functions.R"))
+source(paste0(repo_dir,"/tools/qc_report_aux_functions.R"))
+source(paste0(repo_dir,"/tools/config_session.R"))
+source(paste0(repo_dir,"/tools/association_analysis_methods.R"))
+source(paste0(repo_dir,"/tools/pi1_cook_fx.R"))
+source(paste0(repo_dir,"/tools/get_fx.R"))
+```
+
+```{r parameters}
+# The system's path to the gsutil command
+gsutil_cmd = "~/google-cloud-sdk/bin/gsutil"
+# set a tmp dir for downloading the data
+tmpdir = "ADDPATH"
+
+# load counts from GCP buckets
+# these paths were removed for security reasons, see the repo's readme
+input_bucket = "ADDPATH"
+output_bucket = "ADDPATH"
+# Specify bucket and local path for the phenotypic data
+pheno_bucket = "ADDPATH"
+
+# specify parameters for filtering lowly expressed peaks and normalization
+# keep peaks with at least 10 counts in 4 samples
+min_counts = 10
+present_in_n_samples = 4
+#norm_method = "quantile"
+# specify how many PCs to examine
+num_features = 5000
+num_pcs = 5
+num_pcs_for_outlier_analysis = 3
+#min_pc_ve = 0.05
+# Specify the significance level for association analysis
+# (e.g., between a PC and a clinical variable)
+p_thr = 0.0001
+```
+
+Specifiy the pipeline, metadata, and sample variables for the analysis.
+
+```{r covariates}
+# Define technical and biological variables to be considered in the QC
+pipeline_qc_cols = c("Sample_batch", # batch of samples manually processed together
+                     "Lib_DNA_conc", # library concentration before pooling for sequencing 
+                     "Nuclei_tagmentation", # at the moment, sites report this differently 
+                     "peak_enrich.frac_reads_in_peaks.macs2.frip",
+                     "replication.num_peaks.num_peaks",
+                     "align.samstat.pct_mapped_reads",
+                     "align.dup.pct_duplicate_reads",
+                     "pct_chrM",
+                     "total_primary_alignments", # similar to number of raw reads 
+                     "align.nodup_samstat.total_reads", # number of paired-end reads that go into peak calling 
+                     "align_enrich.tss_enrich.tss_enrich",
+                     "align.frag_len_stat.mono_nuc_peak_exists")
+
+biospec_cols = c("registration.sex","key.sacrificetime",
+                  "animal.key.is_control",
+                  "terminal.weight.bw",
+                  "bid","pid","group","viallabel")
+```
+
+# Load the data from the buckets
+
+```{r load metadata,message=T,warning=T,eval=T}
+# load merged experimental and pipeline meta
+# change path for internal release
+qa_qc = system(sprintf("gsutil ls %s*qa-qc*", input_bucket), intern=T)
+atacseq_meta = dl_read_gcp(qa_qc, sep=',', tmpdir=tmpdir) # dl_read_gcp() from get_fx.R
+atacseq_meta[,viallabel := as.character(viallabel)]
+
+# load pheno -------------------------------------------------------------------------
+
+# Metadata from DMAQC: use the merged data frame
+# These paths were removed, see the repo's readme
+dmaqc_metadata = 'ADDPATH'
+dmaqc_dict = 'ADDPATH'
+
+# download and format phenotypic data 
+dmaqc_metadata = dl_read_gcp(dmaqc_metadata, sep='\t')
+cols = dl_read_gcp(dmaqc_dict, sep='\t')
+old_cols = colnames(dmaqc_metadata)
+new_cols = tolower(cols[match(old_cols, BICUniqueID), FullName]) 
+colnames(dmaqc_metadata) = new_cols # this isn't perfect, but we don't care about the columns it doesn't work for for now
+
+# make some variables human-readable
+# create new variables "protocol", "agegroup", "intervention", "sacrificetime", "sex" with readable strings 
+for (var in c('key.protocol','key.agegroup','key.intervention','key.sacrificetime','registration.sex')){
+  d = cols[Field.Name == gsub('.*\\.','',var)]
+  keys=unname(unlist(strsplit(d[,Categorical.Values],'\\|')))
+  values=tolower(unname(unlist(strsplit(d[,Categorical.Definitions],'\\|'))))
+  names(values) = keys
+  # match keys to values; create new column 
+  new_var = gsub(".*\\.","",var)
+  dmaqc_metadata[,(new_var) := unname(values)[match(get(var), names(values))]]
+}
+# clean up "sacrificetime"
+dmaqc_metadata[,sacrificetime := sapply(sacrificetime, function(x) gsub(' week.*','W',x))]
+# clean up 'intervention'
+dmaqc_metadata[grepl('training',intervention), intervention := 'training']
+# make "group" - "1W", "2W", "4W", "8W", "SED"
+dmaqc_metadata[,group := sacrificetime]
+dmaqc_metadata[intervention == 'control', group := 'SED']
+# make tech ID a string
+dmaqc_metadata[,tissue := specimen.processing.sampletypedescription]
+dmaqc_metadata[,viallabel := as.character(viallabel)]
+
+# merge -------------------------------------------------------------------------
+
+# merge qc
+atacseq_meta = merge(dmaqc_metadata, atacseq_meta, by='viallabel')
+# convert to data.frame for compatibility with other QC report code 
+atacseq_meta = as.data.frame(atacseq_meta, stringsAsFactors=F)
+rownames(atacseq_meta) = atacseq_meta$viallabel
+atacseq_meta$animal.key.is_control = atacseq_meta$key.intervention == 3
+```
+
+```{r load counts}
+atacseq_data = list()
+atacseq_data$data_tables = list()
+atacseq_data$pheno = list()
+for(file in system(sprintf("gsutil ls %s*atac.counts*",input_bucket), intern=T)){
+  tissue_code = gsub("\\..*","",basename(file))
+  tissue = bic_animal_tissue_code$tissue_name_release[bic_animal_tissue_code$bic_tissue_code==tissue_code]
+  
+  counts = dl_read_gcp(file, sep='\t', tmpdir=tmpdir) # data.table
+  peaks = counts[,.(chrom, start, end)]
+  counts = data.frame(counts, check.names=F)
+  # name feature
+  rownames(counts) = paste0(counts$chrom, ':', counts$start, '-', counts$end)
+  counts[,c("chrom","start","end")] = NULL
+  
+  # get metadata
+  curr_meta = atacseq_meta[atacseq_meta$viallabel %in% colnames(counts),]
+  # remove ref std
+  counts = counts[,curr_meta$viallabel]
+  
+  for(get_site in unique(curr_meta$GET_site)){
+    vl = curr_meta$viallabel[curr_meta$GET_site == get_site]
+    site_meta = curr_meta[curr_meta$viallabel %in% vl,]
+    site_counts = counts[,vl]
+    dataset = sprintf("%s,%s", tolower(get_site), tissue)
+    
+    atacseq_data$data_tables[[dataset]] = site_counts
+    atacseq_data$pheno[[dataset]] = site_meta
+  }
+}
+# the same peaks are used for all tissues
+widths = peaks[,end] - peaks[,start]
+#hist(widths, main="Peak widths", breaks=500)
+
+save(atacseq_data, file="atacseq_data-20210510.RData")
+```
+
+Each raw counts table has the same peaks. Write the feature-mapping file and look at distribution of peak annotations.  
+```{r peak annotation, message=F, out.width="50%", out.height="50%"}
+# make TxDb object 
+txdb = makeTxDbFromEnsembl(organism="Rattus norvegicus",
+                           release=96)
+# annotate peaks 
+counts = peaks
+atac_peaks = counts[,.(chrom, start, end)]
+atac_peaks = atac_peaks[grepl("^chr", chrom)] # remove contigs
+atac_peaks[,chrom := gsub("chr","",chrom)]
+peak = GRanges(seqnames = atac_peaks[,chrom], 
+               ranges = IRanges(as.numeric(atac_peaks[,start]), as.numeric(atac_peaks[,end])))
+peakAnno = annotatePeak(peak, 
+                        level = "gene",
+                        tssRegion=c(-1000,1000), 
+                        TxDb=txdb)
+pa = as.data.table(peakAnno@anno)
+# only save peaks with a relationship to a gene
+pa[,short_annotation := annotation]
+pa[grepl('Exon', short_annotation), short_annotation := 'Exon']
+pa[grepl('Intron', short_annotation), short_annotation := 'Intron']
+cols=c('seqnames','start','end')
+pa[,(cols) := lapply(.SD, as.character), .SDcols=cols]
+cols=c('chrom','start','end')
+atac_peaks[,(cols) := lapply(.SD, as.character), .SDcols=cols]
+pa = merge(pa, atac_peaks, by.x=c('seqnames','start','end'), by.y=c('chrom','start','end'), all=T)
+pa[,c('geneChr','strand') := NULL]
+pa[,feature_ID := paste0("chr",seqnames,":",start,"-",end)]
+
+# add Ensembl gene names 
+# GCP bucket address was removed from the next line (genome.gtf file can be used locally)
+system("gsutil cp ADDPATH/genome.gtf .")
+gtf = rtracklayer::import('genome.gtf')
+gtf = as.data.table(gtf)
+gtf = gtf[type=='gene',.(gene_id, gene_name, gene_biotype, protein_id)]
+
+# merge with Ensembl
+pa = merge(pa, gtf, by.x='geneId', by.y='gene_id', all.x=T, suffixes=c('_atac','_rna'))
+pa[,assay := 'epigen-atac-seq']
+setnames(pa, c("geneId","gene_name"), c("ensembl_gene","gene_symbol"))
+setcolorder(pa, c("assay","feature_ID","ensembl_gene","gene_symbol"))
+
+# write to MAWG bucket 
+write_to_bucket(pa, "pass1b-06_epigen-atac-seq_feature-mapping_20210510.txt", "ADDPATH")
+
+# plot 
+pa_table2 = data.table(table(pa[,short_annotation]))
+pa_table2 = pa_table2[order(N, decreasing=T)]
+ggplot(pa, aes(x=short_annotation, fill=short_annotation)) +
+  geom_bar() +
+  theme_classic() +
+  scale_fill_brewer(palette = "Set1") +
+  labs(y='N annotated peaks (log10 scale)', fill='Peak annotation') +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, colour='black', vjust=0.5),
+        axis.title.x = element_blank()) +
+  scale_y_continuous(trans="log10", breaks=c(1, 10, 100, 1000, 1e4, 1e5, 1e6)) +
+  scale_x_discrete(limits = pa_table2[,V1])
+
+pa_table = data.table(table(pa[,short_annotation], pa[,seqnames]))
+ggplot(pa_table, aes(x=V2, y=N, fill=V1)) +
+  geom_bar(stat='identity', position='stack') +
+  theme_classic() +
+  scale_fill_brewer(palette = "Set1") +
+  labs(y='N annotated peaks', fill='Peak annotation', x='Chromosome') +
+  scale_x_discrete(limits = c(as.character(seq(1,20)), 'X', 'Y'))
+```
+
+# MOP-flagged samples
+The ATAC-seq pipeline manual of procedures (MOP) defines a flagged sample (e.g. potentially problematic) as a sample that satisfies one of the following:  
+(1) Number of filtered, non-duplicated, non-mitochondrial paired-end reads $<20M$,
+(2) Alignment rate $<80%$,
+(3) Fraction of reads in sample-level MACS2 peaks $<0.1$, 
+(4) A nucleosome-free region is not present,
+(5) Neither a mononucleosome peak nor a dinucleosome peak is present,
+(6) TSS enrichment < 4
+
+```{r}
+atacseq_meta$pipeline_flags = atacseq_pipeline_flagged_samples(atacseq_meta)
+mop_flagged_samples = rownames(atacseq_meta)[nchar(atacseq_meta$pipeline_flags)>0]
+```
+
+# Dataset normalization
+
+We first remove peaks with low read counts across samples. Then we use limma voom to perform quantile normalizaition. For each dataset (i.e., tissue) we store the normalized data table and all additional variables (e.g., clinical data) in a list called norm_atacseq_data.
+ATAC-seq specific: we show the distribution of peak widths and genomic annotations among the filtered peaks in each tissue. 
+
+```{r,warning=F,message=F}
+norm_atacseq_data = list()
+for(dataset in names(atacseq_data$data_tables)){
+
+  unnorm_counts = atacseq_data$data_tables[[dataset]]
+  curr_samples = colnames(unnorm_counts)
+  
+  # remove non-auto peaks
+  counts = unnorm_counts[grepl("^chr[0-9]|^chrY|^chrX", rownames(unnorm_counts)),]
+  
+  # exclude low count peaks in the current dataset
+  # at least min_counts counts in present_in_n_samples samples
+  filt_counts = counts[rowSums(data.frame(lapply(counts, function(x) as.numeric(x >= min_counts)), check.names=F)) >= present_in_n_samples,]
+  
+  # quantile normalize
+  # this takes a couple of minutes given the size of the peak x sample counts matrix
+  voom_obj = voom(filt_counts,normalize.method = "quantile")
+  norm_counts = round(voom_obj$E,2)
+  
+  # get the dataset metadata
+  curr_meta1 = atacseq_data$pheno[[dataset]][curr_samples,pipeline_qc_cols]
+  curr_meta2 = atacseq_data$pheno[[dataset]][curr_samples,biospec_cols]
+
+  norm_atacseq_data[[dataset]] = list(
+      norm_counts = norm_counts,
+      filt_counts = filt_counts,
+      raw_counts = unnorm_counts,
+      pipeline_meta = curr_meta1,
+      dmaqc_meta = curr_meta2)
+}
+
+save(norm_atacseq_data, file="norm_atacseq_data-0-20210510.RData")
+```
+
+Examine the effect of the normalization process. For each dataset show the boxplots of 20 randomly selected samples.
+
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=T}
+for(i in 1:length(norm_atacseq_data)){
+  unnorm_data = norm_atacseq_data[[i]][["raw_counts"]]
+  norm_data = norm_atacseq_data[[i]][["norm_counts"]]
+  unnorm_data = log2(unnorm_data+1)
+  samp = sample(1:ncol(norm_data))[1:20]
+  curr_name = names(norm_atacseq_data)[i]
+  colnames(unnorm_data) = NULL
+  colnames(norm_data) = NULL
+  boxplot(unnorm_data[,samp],
+          main=paste0(curr_name,"\nlog2 raw counts (",nrow(unnorm_counts)," peaks)"),
+          ylab = "log2 raw counts",xaxt="n")
+  boxplot(norm_data[,samp],
+          main=paste0(curr_name,"\nquantile norm (",nrow(norm_data)," peaks)"),
+          ylab = "quantile normalized",xaxt="n")
+}
+```
+
+# PCA visualization (sex and group)
+
+We plot the top two PCs for each tissue, color and shape correspond to randomization group and sex. 
+
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE}
+for(currname in names(norm_atacseq_data)){
+  # run PCA
+  curr_data = norm_atacseq_data[[currname]][["norm_counts"]]
+
+  # keep N features with highest CVs
+  cv = apply(curr_data, 1, function(x) (sd(x)/mean(x))*100)
+  cv = cv[order(cv, decreasing=T)]
+  pca_data = curr_data[names(cv)[1:num_features],]
+  
+  curr_pca = prcomp(t(pca_data),scale. = T,center = T)
+  curr_pcax = curr_pca$x[,1:num_pcs]
+  explained_var = summary(curr_pca)[["importance"]][3,5]
+  norm_atacseq_data[[currname]][["pca"]] = list(
+    pcax = curr_pcax,explained_var=explained_var
+  )
+  # plot
+  df = data.frame(
+    PC1 = curr_pcax[,1],PC2 = curr_pcax[,2],
+    group = norm_atacseq_data[[currname]][["dmaqc_meta"]][,"group"],
+    sex = as.character(norm_atacseq_data[[currname]][["dmaqc_meta"]][,"registration.sex"]),
+    stringsAsFactors = F
+  )
+  df$sex[df$sex=="1"] = "F"
+  df$sex[df$sex=="2"] = "M"
+  df$group = factor(df$group, levels = c("SED",
+                                         "1W",
+                                         "2W",
+                                         "4W",
+                                         "8W"))
+  p = ggplot(df) + 
+      geom_point(aes(x=PC1, y=PC2,fill=group, shape=sex), colour="black", size=2) +
+      ggtitle(currname) + 
+      theme_classic() +
+      scale_fill_manual(values=c(MotrpacBicQC::group_cols)) +
+      scale_shape_manual(values=c('F'=21, 'M'=24)) +
+      labs(x=sprintf("PC1 (%s%%)", signif(summary(curr_pca)[["importance"]][2,1]*100, digits=3)),
+           y=sprintf("PC2 (%s%%)", signif(summary(curr_pca)[["importance"]][2,2]*100, digits=3))) +
+      guides(fill=guide_legend(override.aes = list(shape=21)))
+  plot(p)
+}
+save(norm_atacseq_data, file="norm_atacseq_data-1-20210510.RData")
+```
+
+# PC-based association analysis
+
+Here we analyze the top principal components (5) in each tissue and compute their association with the selected  variables above (e.g., the pipeline qc metrics). We use Spearman correlation and a linear test for significance. 
+
+For each dataset we also add the correlations among the metadata variables. These two analyses should be interpreted together, as the analyzed variables are not independent.
+
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=T}
+pcs_vs_qc_var_report = c()
+metadata_variable_assoc_report = c()
+for(currname in names(norm_atacseq_data)){
+  curr_meta = cbind(norm_atacseq_data[[currname]]$pipeline_meta,
+                     norm_atacseq_data[[currname]]$dmaqc_meta)
+  # remove the text group description
+  curr_meta = curr_meta[!grepl("randgr",names(curr_meta))]
+  # remove metadata variables with NAs
+  curr_meta = curr_meta[,!apply(is.na(curr_meta),2,any)]
+  # remove bid and pid
+  curr_meta = curr_meta[,!grepl("pid|bid|viallabel|group",names(curr_meta))]
+  
+  # remove 0-variance meta
+  to_remove = colnames(curr_meta)[lapply(curr_meta, stats::var) == 0]
+  curr_meta[,to_remove] = NULL
+  
+  # take the PCA results
+  curr_pcax = norm_atacseq_data[[currname]][["pca"]][["pcax"]]
+  
+  corrs = cor(curr_pcax,curr_meta,method="spearman")
+  corrsp = pairwise_eval(
+    curr_pcax,curr_meta,func=pairwise_association_wrapper,
+    f=1)
+  
+  # Some ggplots have to be printed to be shown in the notebook
+  print(ggcorrplot(t(corrs),lab=T,lab_size=2.5,hc.order = F) +
+    ggtitle(currname) +
+    theme(plot.title = element_text(hjust = 0.5,size=20)))
+  
+  for(i in 1:nrow(corrsp)){
+    for(j in 1:ncol(corrsp)){
+      if(corrsp[i,j]>p_thr){next}
+      pcs_vs_qc_var_report = rbind(pcs_vs_qc_var_report,
+            c(currname,
+              rownames(corrsp)[i],colnames(corrsp)[j],corrs[i,j],corrsp[i,j])
+            )
+    }
+  }
+  
+  # compute correlations among the metadata variables
+  corrs = cor(curr_meta,method="spearman")
+  corrsp = pairwise_eval(
+    curr_meta,func=pairwise_association_wrapper,
+    f=1)
+  
+  # Some ggplots have to be printed to be shown in the notebook
+  print(ggcorrplot(corrs,lab=T,lab_size=1.5,hc.order=T))
+  
+  for(n1 in rownames(corrsp)){
+    for(n2 in rownames(corrsp)){
+      if(n1==n2){break}
+      if(n1 %in% biospec_cols &&
+         n2 %in% biospec_cols) {next}
+      if(corrsp[n1,n2]>p_thr){next}
+      metadata_variable_assoc_report = rbind(metadata_variable_assoc_report,
+            c(currname,n1,n2,corrs[n1,n2],corrsp[n1,n2])
+            )
+    }
+  }
+}
+# Format the reports - for a nicer presentation in a table
+colnames(metadata_variable_assoc_report) = c(
+  "Dataset(tissue,site)","Var1","Var2","rho(spearman)","p-value")
+colnames(pcs_vs_qc_var_report) = c("Dataset(tissue,site)","PC",
+  "qc_metric","rho(spearman)","p-value")
+pcs_vs_qc_var_report[,5] = format(
+  as.numeric(pcs_vs_qc_var_report[,5]),digits=3)
+pcs_vs_qc_var_report[,4] = format(
+  as.numeric(pcs_vs_qc_var_report[,4]),digits=3)
+metadata_variable_assoc_report[,5] = format(
+  as.numeric(metadata_variable_assoc_report[,5]),digits=3)
+metadata_variable_assoc_report[,4] = format(
+  as.numeric(metadata_variable_assoc_report[,4]),digits=3)
+```
+
+## Print the significant results in tables
+
+```{r,eval=T}
+kable(pcs_vs_qc_var_report,longtable=T,
+      caption = "Correlations between PCs and other variables")  %>%
+  kable_styling(latex_options = c("repeat_header"),font_size = 8)
+
+kable(metadata_variable_assoc_report,longtable=T,
+      caption = "Correlations between metadata variables")%>%
+  kable_styling(latex_options = c("repeat_header"),font_size = 8)
+```
+
+## PCA outliers
+
+In this analysis, outliers are flagged by examining the boxplot of each PC, extending its whiskers to three times the inter-quantile range away from the boxplot. Samples outside this range are then flagged. 
+
+**Note that samples are flagged using an automatic analysis of the principal components. Such analyses may flag samples because of true biological effects and thus further examination is required before determining if flagged samples represent low quality samples.**
+
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=T}
+pca_outliers_report = c()
+for(currname in names(norm_atacseq_data)){
+  curr_pcax = curr_pcax = norm_atacseq_data[[currname]][["pca"]][["pcax"]]
+  
+  # Univariate: use IQRs
+  pca_outliers = c()
+  for(j in 1:num_pcs_for_outlier_analysis){
+    outlier_values <- boxplot.stats(curr_pcax[,j],coef = 3)$out
+    for(outlier in names(outlier_values)){
+      pca_outliers_report = rbind(pca_outliers_report,
+       c(currname,paste("PC",j,sep=""),outlier,
+         format(outlier_values[outlier],digits=5))
+      )
+      if(!is.element(outlier,names(pca_outliers))){
+        pca_outliers[outlier] = outlier_values[outlier]
+      }
+    }
+  }
+  
+  # Plot the outliers
+  if(length(pca_outliers)>0){
+    # print(length(kNN_outliers))
+    df = data.frame(curr_pcax,
+                outliers = rownames(curr_pcax) %in% names(pca_outliers))
+    col = rep("black",nrow(df))
+    col[df$outliers] = "green"
+    plot(df$PC1,df$PC2,pch = as.numeric(df$outliers),col=col,lwd=2,cex=1,
+         main = paste(currname,"\nflagged outliers"),
+         xlab = "PC1",ylab="PC2")
+    plot(df$PC3,df$PC4,pch = as.numeric(df$outliers),col=col,lwd=2,cex=1,
+         main = paste(currname,"\nflagged outliers"),
+         xlab = "PC3",ylab="PC4")
+  }
+}
+if(!is.null(dim(pca_outliers_report))){
+  colnames(pca_outliers_report) =  c("dataset","PC","sample","score")
+}
+```
+
+# Sex checks
+
+We verify that the sex of a sample can be predicted from the percent of chromosome Y and percent of chromosome X reads. This is done automatically by training a logistic regression classifier, but we also plot the 2D plot for each tissue.
+
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=T}
+# sex checks - using simple logistic regression classifier (LOO-CV)
+sex_read_info = cbind(atacseq_meta$pct_chrX,atacseq_meta$pct_chrY)
+rownames(sex_read_info) = rownames(atacseq_meta)
+sex_check_outliers = c()
+for(currname in names(norm_atacseq_data)){
+  # 1 is female
+  curr_sex = norm_atacseq_data[[currname]]$dmaqc_meta$registration.sex
+  read_info = sex_read_info[
+    rownames(norm_atacseq_data[[currname]]$dmaqc_meta),]
+  df = data.frame(sex = as.character(curr_sex),
+                  pct_chrX = read_info[,1],
+                  pct_chrY = read_info[,2],stringsAsFactors = F)
+  df$sex[df$sex=="1"] = "F"
+  df$sex[df$sex=="2"] = "M"
+  
+  p = ggplot(df) + 
+      geom_point(aes(x=pct_chrX, y=pct_chrY,col=sex, shape=sex)) +
+      ggtitle(paste0(currname," - sex check")) +
+    theme_classic()
+  plot(p)
+  
+  train_control <- trainControl(method = "cv", number = nrow(df),
+                                savePredictions = TRUE)
+  # train the model on training set
+  model <- train(sex ~ .,data = df,
+               trControl = train_control,
+               method = "glm", family=binomial(link="logit"))
+  # CV results
+  cv_res = model$pred
+  cv_errors = cv_res[,1] != cv_res[,2]
+  err_samples = rownames(df)[cv_res[cv_errors,"rowIndex"]]
+  for(samp in err_samples){
+    sex_check_outliers = rbind(sex_check_outliers,
+                               c(currname,samp))
+  }
+}
+if(! is.null(dim(sex_check_outliers))){
+  colnames(sex_check_outliers) = c("dataset","sample")
+}
+```
+
+# Print all flagged samples
+
+```{r flagged samples}
+# add the dataset name to mop outliers
+sample2dataset = paste(tolower(atacseq_meta[,c("Tissue")]),
+                       tolower(atacseq_meta[,c("GET_site")]),sep=",")
+names(sample2dataset) = rownames(atacseq_meta)
+
+all_flagged = NULL
+if(length(pca_outliers_report)>0){
+  all_flagged = union(all_flagged,pca_outliers_report[,"sample"])
+}
+if(length(sex_check_outliers)>0){
+  all_flagged = union(all_flagged,sex_check_outliers[,"sample"])
+}
+all_flagged = union(all_flagged,mop_flagged_samples)
+
+flagged_sample_report = c()
+for(samp in all_flagged){
+  samp_dataset = sample2dataset[samp]
+  samp_metric = NULL
+  if(samp %in% mop_flagged_samples){
+    samp_metric = atacseq_meta[samp,"pipeline_flags"]
+  }
+  if(!is.null(dim(sex_check_outliers)) &&
+     samp %in% sex_check_outliers[,"sample"]){
+    samp_metric = c(samp_metric,"Sex-flagged")
+  }
+  if(!is.null(dim(pca_outliers_report)) &&
+     samp %in% pca_outliers_report[,"sample"]){
+    curr_pcs = pca_outliers_report[pca_outliers_report[,"sample"]==samp,"PC"]
+    samp_metric = c(samp_metric,curr_pcs)
+  }
+  flagged_sample_report = rbind(flagged_sample_report,
+      c(samp,samp_dataset,paste(samp_metric,collapse=","))
+  )
+}
+colnames(flagged_sample_report) = c("Viallabel","Dataset","Methods")
+kable(flagged_sample_report,longtable=T,
+      caption = "Outliers detected, MOP, Sex check, and by tissue PCA data")%>%
+  kable_styling(font_size = 8,latex_options = c("hold_position", "repeat_header"))
+```
+
+## Save the results in the bucket
+
+```{r}
+for(dataset in names(norm_atacseq_data)){
+
+  x = norm_atacseq_data[[dataset]]$norm_counts
+  pheno_data = atacseq_data$pheno[[dataset]]
+  
+  x_bids = pheno_data[colnames(x),"bid"]
+  x_pids = pheno_data[colnames(x),"pid"]
+  newx = cbind(rownames(x),x)
+  rownames(newx) = NULL
+  colnames(newx)[1] = "feature_ID"
+  newx = rbind(c("bid",x_bids),newx)
+  newx = rbind(c("pid",x_pids),newx)
+  newx = rbind(c("viallabel",colnames(x)),newx)
+  colnames(newx) = NULL
+  
+  # a simple sanity check
+  m = newx[-c(1:3),-1]
+  mode(m) = "numeric"
+  if(!all(abs(m-x)< 1e-05)){
+    print("Error in parsing the matrix, breaking")
+    break
+  }
+  
+  # save the output to the target bucket
+  splits = unname(unlist(strsplit(dataset, ',')))
+  file_name = sprintf("pass1b-06_epigen-atac-seq_%s_%s_quant-norm.tsv",
+                      splits[2],
+                      splits[1])
+  write_to_bucket(newx, file_name, output_bucket, tmpdir='.', sep='\t', col.names=F, row.names=F, quote=F)
+
+}
+```
