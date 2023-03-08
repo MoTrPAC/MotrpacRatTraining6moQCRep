@@ -218,9 +218,8 @@ pa[,c('geneChr','strand') := NULL]
 pa[,feature_ID := paste0("chr",seqnames,":",start,"-",end)]
 
 # add Ensembl gene names 
-# GCP bucket address was removed from the next line (genome.gtf file can be used locally)
-system("gsutil cp ADDPATH/genome.gtf .")
-gtf = rtracklayer::import('genome.gtf')
+# Get this file from ext_data and unzip it
+gtf = rtracklayer::import(paste0(repo_dir,'genome.gtf'))
 gtf = as.data.table(gtf)
 gtf = gtf[type=='gene',.(gene_id, gene_name, gene_biotype, protein_id)]
 
