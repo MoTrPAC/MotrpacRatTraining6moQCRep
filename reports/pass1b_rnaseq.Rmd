@@ -25,20 +25,18 @@ for (lib_name in session_packages){
 
 ```{r}
 # Specify the parameters required for the analysis
-# This dir should have the motrpac-bic-norm-qc repo
-repo_local_dir = "~/Desktop/repos/"
+# This directory should have the MotrpacRatTraining6moQCRep repository
+# clone from: https://github.com/MoTrPAC/MotrpacRatTraining6moQCRep
+repo_local_dir = "~/Desktop/repos/MotrpacRatTraining6moQCRep"
 # Runnable command for gsutil
 gsutil_cmd = "~/google-cloud-sdk/bin/gsutil"
 # Where should the data be downloaded to
-local_data_dir = "~/Desktop/MoTrPAC/data/pass_1b/rnaseq/"
-# Bucket structure is: tissue/platform/results/<data files>. For GET, this path should
-# also have a qa_qc directory with the qc_metrics and sample_metadata files.
-bucket = "gs://motrpac-release-data-staging/Results/pass1b-06/transcriptomics/"
+local_data_dir = "ADDPATH"
+# GCP bucket with the data
+bucket = "ADDPATH"
 # Specify bucket and local path for the phenotypic data
-# this path is internal to BIC - faster
-# pheno_bucket = "gs://bic_data_analysis/pass1b/pheno_dmaqc/merged2020-06-12/"
-pheno_bucket = "gs://motrpac-internal-release2-results/pass1b-06/phenotype/"
-pheno_local_dir = "~/Desktop/MoTrPAC/data/pass_1b/dmaqc_pheno/"
+pheno_bucket = "ADDPATH"
+pheno_local_dir = "ADDPATH"
 # specify parameters for filtering lowly expressed genes and normalization
 # within a tissue keep genes with cpm >= min_cpm in at least min_num_samples samples
 min_cpm = 0.5
@@ -71,11 +69,11 @@ biospec_cols = c("registration.sex","key.anirandgroup",
 
 ```{r,,warning=F,results=F,message=F}
 # load functions and libraries
-source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/unsupervised_normalization_functions.R"))
-source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/gcp_functions.R"))
-source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/qc_report_aux_functions.R"))
-source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/config_session.R"))
-source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/association_analysis_methods.R"))
+source(paste0(repo_local_dir,"/tools/unsupervised_normalization_functions.R"))
+source(paste0(repo_local_dir,"/tools/gcp_functions.R"))
+source(paste0(repo_local_dir,"/tools/qc_report_aux_functions.R"))
+source(paste0(repo_local_dir,"/tools/config_session.R"))
+source(paste0(repo_local_dir,"/tools/association_analysis_methods.R"))
 ```
 
 # Load the data from the buckets
