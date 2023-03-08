@@ -42,23 +42,17 @@ knitr::opts_chunk$set(echo = TRUE)
 edger_tol = 1e-05
 
 # Specify the parameters required for the analysis
-# This dir should have the motrpac-bic-norm-qc repo
-repo_local_dir = "~/Desktop/repos/"
-#repo_local_dir = "~/work/repo/"
+# This directory should have the MotrpacRatTraining6moQCRep repository
+# clone from: https://github.com/MoTrPAC/MotrpacRatTraining6moQCRep
+repo_local_dir = "~/Desktop/repos/MotrpacRatTraining6moQCRep"
 # Runnable command for gsutil
 gsutil_cmd = "~/google-cloud-sdk/bin/gsutil"
 # Where should the data be downloaded to
-local_data_dir = "~/Desktop/MoTrPAC/data/pass_1b/rrbs/"
-# Bucket structure is: tissue/platform/results/<data files>. For GET, this path should
-# also have a qa_qc directory with the qc_metrics and sample_metadata files.
-# bucket = "gs://my-bucket/Results/pass1b-06/epigenomics/"
-bucket = "gs://my-bucket/Results/pass1b-06/epigenomics/"
-###testing bucket
-#bucket = "gs://my-bucket/Results/pass1b-06/epigenomics/"
-# Specify bucket and local path for the phenotypic data
-# this path is internal to BIC - faster
-pheno_bucket = "gs://my-bucket/pass1b-06/pheno_dmaqc/merged2021-09-09/"
-pheno_local_dir = "~/Desktop/MoTrPAC/data/pass_1b/dmaqc_pheno/"
+local_data_dir = "ADDPATH"
+# these paths were removed for security reasons, see the repo's readme
+bucket = "ADDPATH"
+pheno_bucket = "ADDPATH"
+pheno_local_dir = "ADDPATH"
 
 # we require a site to have a total count
 # (both methylated and unmethylated) of at least min_count_coverage in 
@@ -111,10 +105,8 @@ samples_to_remove = c(samples_to_remove,
 # run_mode = "windows", wsize=500,
 # min_count_coverage = 10, min_per_samples = 1
 # rho for clustering is the default of 0.7
-data_out_bucket = "gs://my-bucket/pass1b-06/epigen-rrbs-v2/data/"
-dea_out_bucket = "gs://my-bucket/pass1b-06/epigen-rrbs-v2/dea/"
-#data_out_bucket = "gs://my-bucket/test/epigen-rrbs/mawg/data/"
-#dea_out_bucket = "gs://my-bucket/test/epigen-rrbs/mawg/dea/"
+data_out_bucket = "ADDPATH"
+dea_out_bucket = "ADDPATH"
 ```
 
 ```{r}
@@ -131,11 +123,11 @@ biospec_cols = c("registration.sex","key.anirandgroup",
 
 ```{r,,warning=F,results=F,message=F}
 # load functions and libraries
-source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/unsupervised_normalization_functions.R"))
-source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/gcp_functions.R"))
-source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/qc_report_aux_functions.R"))
-source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/config_session.R"))
-source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/association_analysis_methods.R"))
+source(paste0(repo_local_dir,"/tools/unsupervised_normalization_functions.R"))
+source(paste0(repo_local_dir,"/tools/gcp_functions.R"))
+source(paste0(repo_local_dir,"/tools/qc_report_aux_functions.R"))
+source(paste0(repo_local_dir,"/tools/config_session.R"))
+source(paste0(repo_local_dir,"/tools/association_analysis_methods.R"))
 ```
 
 Get the Rat annotations:
