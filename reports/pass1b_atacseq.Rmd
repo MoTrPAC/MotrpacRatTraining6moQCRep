@@ -18,7 +18,7 @@ knitr::opts_knit$set(root.dir = "ADDPATH")
 
 # This directory should have the MotrpacRatTraining6moQCRep repository
 # clone from: https://github.com/MoTrPAC/MotrpacRatTraining6moQCRep
-repo_dir = '~/Desktop/repos'
+repo_dir = '~/Desktop/repos/MotrpacRatTraining6moQCRep'
 
 # configuration of the session: load libraries and functions
 session_packages = c("stats","apeglm","preprocessCore","impute",
