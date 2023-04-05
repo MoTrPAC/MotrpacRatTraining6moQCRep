@@ -19,13 +19,13 @@ Additional comments about RRBS data:
    (keep.lib.sizes=FALSE causes the library sizes to be recomputed after applying a filter)
 
 
-This paper uses glmFit-based pipeline, whereas others recommend using glmQFit as it is more accurate for controlling type 1 error - see comments in https://support.bioconductor.org/p/76790/#:~:text=glmQLFit%20uses%20the%20trended%20NB,a%20GLM%20%2D%20and%20that's%20it
+This paper uses glmFit-based pipeline, whereas others recommend using glmQFit as it is more accurate for controlling type 1 error - see comments  https://support.bioconductor.org/p/76790/#:~:text=glmQLFit%20uses%20the%20trended%20NB,a%20GLM%20%2D%20and%20that's%20it
 
-```{r setup, include=FALSE}
+```{r setup, include=FALSE,eval=T}
 # set the current session
 session_packages = c("knitr","kableExtra","stats","apeglm","preprocessCore",
                      "affy","NOISeq","edgeR","data.table","ggplot2","ggcorrplot",
-                     "caret","dplyr","e1071", "metap","stringr")
+                     "caret","dplyr","e1071", "metap","stringr","ggrepel")
 for (lib_name in session_packages){
   tryCatch({library(lib_name,character.only = T)}, error = function(e) {
     print(paste("Cannot load",lib_name,", please install"))
@@ -36,23 +36,29 @@ knitr::opts_chunk$set(echo = TRUE)
 
 # Specify parameters
 
-```{r,message=FALSE,warning=FALSE}
+```{r,message=FALSE,warning=FALSE,eval=T}
 
 # edgeR's tolerance parameter: default is 1e-06, but this seems to be too slow
 edger_tol = 1e-05
 
 # Specify the parameters required for the analysis
-# This directory should have the MotrpacRatTraining6moQCRep repository
-# clone from: https://github.com/MoTrPAC/MotrpacRatTraining6moQCRep
-repo_local_dir = "~/Desktop/repos/MotrpacRatTraining6moQCRep"
+# This dir should have the motrpac-bic-norm-qc repo
+#repo_local_dir = "~/Desktop/repos/"
+repo_local_dir = "~/work/repo/"
 # Runnable command for gsutil
 gsutil_cmd = "~/google-cloud-sdk/bin/gsutil"
 # Where should the data be downloaded to
-local_data_dir = "ADDPATH"
-# these paths were removed for security reasons, see the repo's readme
-bucket = "ADDPATH"
-pheno_bucket = "ADDPATH"
-pheno_local_dir = "ADDPATH"
+local_data_dir = "~/Desktop/MoTrPAC/data/pass_1b/rrbs/"
+# Bucket structure is: tissue/platform/results/<data files>. For GET, this path should
+# also have a qa_qc directory with the qc_metrics and sample_metadata files.
+# bucket = "gs://my-bucket/Results/pass1b-06/epigenomics/"
+bucket = "gs://my-bucket/Results/pass1b-06/epigenomics/"
+###testing bucket
+#bucket = "gs://my-bucket/Results/pass1b-06/epigenomics/"
+# Specify bucket and local path for the phenotypic data
+# this path is internal to BIC - faster
+pheno_bucket = "gs://my-bucket/pass1b-06/pheno_dmaqc/merged2021-09-09/"
+pheno_local_dir = "~/Desktop/MoTrPAC/data/pass_1b/dmaqc_pheno/"
 
 # we require a site to have a total count
 # (both methylated and unmethylated) of at least min_count_coverage in 
@@ -92,21 +98,23 @@ num_pcs_for_outlier_analysis = 3
 # Specify the significance level for association analysis
 # (e.g., between a PC and a clinical variable)
 p_thr = 0.0001
-OUTLIER_IQR_THR = 5 # should be three in other analyses
+OUTLIER_IQR_THR = 5
 # Outliers added by MSSM
-samples_to_remove = c("90266016903","90218016903","90578016903",
-                      "90450015903","90585017004")
+#samples_to_remove = #c("90266016903","90218016903","90578016903",
+#                      "90450015903","90585017004")
 # outliers added by BIC (lung and hippo outliers, August 2021)
-samples_to_remove = c(samples_to_remove,
-                      c("90406015203","90251016604"))
+#samples_to_remove = c(samples_to_remove,
+#                      c("90406015203","90251016604"))
 
 # output path
 # v2 means the results of a pipeline using
 # run_mode = "windows", wsize=500,
 # min_count_coverage = 10, min_per_samples = 1
 # rho for clustering is the default of 0.7
-data_out_bucket = "ADDPATH"
-dea_out_bucket = "ADDPATH"
+#data_out_bucket = #"gs://my-bucket/pass1b-06/epigen-rrbs-v2/data/"
+#dea_out_bucket = #"gs://my-bucket/pass1b-06/epigen-rrbs-v2/dea/"
+data_out_bucket = "gs://my-bucket/test/epigen-rrbs/mawg/data_03-27-23/"
+dea_out_bucket = "gs://my-bucket/test/epigen-rrbs/mawg/dea_03-27-23/"
 ```
 
 ```{r}
@@ -123,16 +131,16 @@ biospec_cols = c("registration.sex","key.anirandgroup",
 
 ```{r,,warning=F,results=F,message=F}
 # load functions and libraries
-source(paste0(repo_local_dir,"/tools/unsupervised_normalization_functions.R"))
-source(paste0(repo_local_dir,"/tools/gcp_functions.R"))
-source(paste0(repo_local_dir,"/tools/qc_report_aux_functions.R"))
-source(paste0(repo_local_dir,"/tools/config_session.R"))
-source(paste0(repo_local_dir,"/tools/association_analysis_methods.R"))
+source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/unsupervised_normalization_functions.R"))
+source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/gcp_functions.R"))
+source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/qc_report_aux_functions.R"))
+source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/config_session.R"))
+source(paste0(repo_local_dir,"motrpac-bic-norm-qc/tools/association_analysis_methods.R"))
 ```
 
 Get the Rat annotations:
 
-```{r}
+```{r,eval=T}
 # manage the gene annotation
 # # Install the rat db
 # if (!requireNamespace("BiocManager", quietly = TRUE))
@@ -160,7 +168,7 @@ rem_obj = sapply(bis_files,file.remove)
 
 Now load and filter the RRBS data:
 
-```{r}
+```{r,eval=F}
 obj = list(
   downloaded_files = list.files(local_data_dir,full.names = T,recursive = T)
 )
@@ -310,6 +318,9 @@ if(load_processed_data_from_rdata &&
       keep[!grepl("chr",Chr) ] <- FALSE
       # remove M chromosome (otherwise we get error when assigning annotation below)
       keep[Chr=="chrM"] <- FALSE
+      #remove sex chromosomes for the PCA per Yongchao's suggestion
+      keep[Chr=="chrX"] <- FALSE
+      keep[Chr=="chrY"] <- FALSE
       print(paste("Data from tissue",tissue,"was loaded into session"))
       print(paste("how many sites were removed (unassembled+chrM)?",sum(!keep)))
       # keep.lib.sizes=FALSE causes the library sizes to be recomputed
@@ -478,6 +489,9 @@ We transform the normalized data into M values and quantile normalize the result
 
 ```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=T}
 # a helper function to run MDS on the top coefficient of variation features
+# a helper function to run MDS on the top coefficient of variation features
+load("motrpac-bic-norm-qc/bic_qc_reports/inprogress/tissue2rrbs_processed_data2.RData")
+samples_to_remove=c()
 top_var_plotMDS<-function(x,n=50000,samples_to_remove=NULL,...){
   n = min(n,nrow(x))
   cvs = apply(x,1,sd)/abs(rowMeans(x))
@@ -556,7 +570,7 @@ for(tissue in names(tissue2rrbs_data)){
 
 # Examine the pipeline's technical covariates
 
-```{r}
+```{r,eval=T}
 tech_var_results = matrix(-1,nrow = length(tissue2Mmatrix),ncol=length(pipeline_qc_cols))
 colnames(tech_var_results) = pipeline_qc_cols
 rownames(tech_var_results) = names(tissue2Mmatrix)
@@ -675,13 +689,26 @@ for(tissue in names(tissue2Mmatrix)){
   df = data.frame(curr_pcax,
     randgroup = pheno_data[rownames(curr_pcax),"key.anirandgroup"],
     sex = as.character(pheno_data[rownames(curr_pcax),"registration.sex"]),
+    id = pheno_data[rownames(curr_pcax),"viallabel"],
     stringsAsFactors = F
   )
   df$sex[df$sex=="1"] = "F"
   df$sex[df$sex=="2"] = "M"
+  flag_samples=c(90266016903,90218016903,90578016903,90450015903,90585017004,90406015203,90251016604)
+  # check data type of id column and cast it to character
+if (class(df$id) != "character") {
+  df$id <- as.character(df$id)
+}
+
+  df$id <- ifelse(df$id %in% flag_samples, df$id, NA)
   p = ggplot(df) + 
       geom_point(aes(x=PC1, y=PC2,col=randgroup, shape=sex)) +
-      ggtitle(tissue)
+      ggtitle(tissue) 
+  p=p+geom_label_repel(aes(x=PC1,y=PC2,label = id),
+                  box.padding   = 1, 
+                  point.padding = 0.5,
+                  segment.color = 'grey50') +
+  theme_classic()
   plot(p)
   tissue2pca[[tissue]] = df
   gc()
@@ -694,7 +721,7 @@ Here we analyze the top principal components (5) in each tissue and compute thei
 
 For each dataset we also add the correlations among the metadata variables. These two analyses should be interpreted together, as the analyzed variables are not independent.
 
-```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE}
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=T}
 pcs_vs_qc_var_report = c()
 metadata_variable_assoc_report = c()
 for(currname in names(tissue2Mmatrix)){
@@ -776,7 +803,7 @@ metadata_variable_assoc_report[,4] = format(
 
 ## Print the significant results in tables
 
-```{r}
+```{r,eval=T}
 kable(pcs_vs_qc_var_report,longtable=T,
       caption = "Correlations between PCs and other variables")  %>%
   kable_styling(latex_options = c("repeat_header"),font_size = 8)
@@ -793,40 +820,57 @@ In this analysis, outliers are flagged by examining the boxplot of each PC, exte
 
 **Note that samples are flagged using an automatic analysis of the principal components. Such analyses may flag samples because of true biological effects and thus further examination is required before determining if flagged samples represent low quality samples.**
 
-```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE}
-pca_outliers_report = c()
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=T}
+pca_outliers_report = list()
 for(currname in names(tissue2pca)){
   curr_pcax = tissue2pca[[currname]]
   curr_pcax = curr_pcax[,grepl("^PC",colnames(curr_pcax))]
   
   # Univariate: use IQRs
-  pca_outliers = c()
+  pca_outliers = list()
   for(j in 1:ncol(curr_pcax)){
-    outlier_values <- boxplot.stats(curr_pcax[,j],coef = OUTLIER_IQR_THR)$out
-    for(outlier in names(outlier_values)){
+    outlier_values <- boxplot.stats(curr_pcax[,j],coef =OUTLIER_IQR_THR)$out
+    for(i in seq_along(outlier_values)){
+      outlier = paste("outlier", i, sep="")
+      row_index = which(curr_pcax[,j] == outlier_values[i])
+      row_name = rownames(curr_pcax)[row_index]
       pca_outliers_report = rbind(pca_outliers_report,
-       c(currname,paste("PC",j,sep=""),outlier,
-         format(outlier_values[outlier],digits=5))
+       c(currname,paste("PC",j,sep=""),
+         row_name, format(outlier_values[i],digits=5))
       )
       if(!is.element(outlier,names(pca_outliers))){
-        pca_outliers[outlier] = outlier_values[outlier]
+        pca_outliers[[outlier]] = outlier_values[i]
       }
     }
   }
   
   # Plot the outliers
   if(length(pca_outliers)>0){
-    # print(length(kNN_outliers))
-    df = data.frame(curr_pcax,
-                outliers = rownames(curr_pcax) %in% names(pca_outliers))
-    col = rep("black",nrow(df))
-    col[df$outliers] = "green"
-    plot(df$PC1,df$PC2,pch = as.numeric(df$outliers),col=col,lwd=2,cex=1,
-         main = paste(currname,"flagged outliers"),
-         xlab = "PC1",ylab="PC2")
-    plot(df$PC3,df$PC4,pch = as.numeric(df$outliers),col=col,lwd=2,cex=1,
-         main = paste(currname,"flagged outliers"),
-         xlab = "PC3",ylab="PC4")
+   
+    df = data.frame(curr_pcax)
+    # Create a new column to indicate if a row is an outlier
+    df$outliers <- rownames(df) %in% pca_outliers_report[, 3]
+    
+    # Create a new column to indicate the color of the points
+    df$color <- ifelse(df$outliers, "green", "black")
+    
+    # Plot PC1 vs. PC2 with outlier points in green
+    plot(df$PC1, df$PC2, pch=19, col=df$color, lwd=2, cex=1,
+       main=paste(currname, "flagged outliers"),
+       xlab="PC1", ylab="PC2")
+    
+    # Add a legend to the plot
+    legend("topleft", legend=c("Outliers", "Non-Outliers"), 
+         col=c("green", "black"), pch=19, bty="n")
+    
+    # Plot PC3 vs. PC4 with outlier points in green
+    plot(df$PC3, df$PC4, pch=19, col=df$color, lwd=2, cex=1,
+       main=paste(currname, "flagged outliers"),
+       xlab="PC3", ylab="PC4")
+    
+    # Add a legend to the plot
+    legend("topleft", legend=c("Outliers", "Non-Outliers"), 
+         col=c("green", "black"), pch=19, bty="n")
   }
 }
 if(!is.null(dim(pca_outliers_report))){
@@ -838,7 +882,7 @@ if(!is.null(dim(pca_outliers_report))){
 
 We verify that the sex of a sample can be predicted from the percent of chromosome Y and percent of chromosome X reads. This is done automatically by training a logistic regression classifier, but we also plot the 2D plot for each tissue.
 
-```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE}
+```{r,out.height='50%',out.width='50%',message=FALSE,warning=FALSE,eval=T}
 # sex checks - using simple logistic regression classifier (LOO-CV)
 sex_read_info = cbind(pipelineqc_scores$pct_chrX,pipelineqc_scores$pct_chrY)
 rownames(sex_read_info) = rownames(pipelineqc_scores)
@@ -876,7 +920,7 @@ if(! is.null(dim(sex_check_outliers))){
 
 # Print all flagged samples
 
-```{r}
+```{r,eval=T}
 # add the dataset name to mop outliers
 sample2dataset = paste(tolower(pipelineqc_scores[,"Tissue"]),
         tolower(pipelineqc_scores[,"GET_site"]),sep=",")
@@ -920,7 +964,7 @@ kable(flagged_sample_report,longtable=T,
 
 ## Save the results in the bucket
 
-```{r,eval=T}
+```{r,eval=F}
 # # use the raw bucket names as the output location
 # # (implied assumption: rna_seq_data and norm_rnaseq_data have the same order)
 # get_out_bucket_from_local_file_name<-function(b,input_bucket,shift_size=3){
