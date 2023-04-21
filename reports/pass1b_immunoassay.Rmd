@@ -30,7 +30,7 @@ source(paste0(repo_dir,"/tools/gcp_functions.R"))
 
 ## Load the data from the buckets
 ```{r Load the data }
-gcp_bucket = "gs://my-project-transfer-stanford/immunoassay/rat/batch1_20210215"
+gcp_bucket = "gs://my-bucket/immunoassay/rat/batch1_20210215"
 bead_counts = dl_read_gcp(sprintf("%s/bead_counts/pass1b-06_immunoassay_bead-counts.txt", gcp_bucket), 
                           OUTDIR=tmp_dir, sep = "\t")
 metadata = dl_read_gcp(sprintf("%s/sample_metadata_20210803.csv", gcp_bucket), 
