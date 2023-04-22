@@ -1,5 +1,9 @@
 # MotrpacRatTraining6moQCRep
 
+<!-- badges: start -->
+[![DOI](https://zenodo.org/badge/605325589.svg)](https://zenodo.org/badge/latestdoi/605325589)
+<!-- badges: end -->
+
 ## About this repository
 
 This repository provides R Markdown scripts (.Rmd) and corresponding HTML reports with
