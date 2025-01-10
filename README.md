@@ -10,7 +10,9 @@ This repository provides R Markdown scripts (.Rmd) and corresponding HTML report
 the post-quantification analyses of the data presented in the main paper for the first
 large-scale multi-omic multi-tissue endurance exercise training study conducted
 in young adult rats by the Molecular Transducers of Physical Activity Consortium
-(MoTrPAC). Find the [preprint on bioRxiv](https://doi.org/10.1101/2022.09.21.508770).
+(MoTrPAC). 
+Find the open access [manuscript published on Nature](https://www.nature.com/nature/volumes/629/issues/8010).
+
 
 Each omic data generated for the paper above had a pipeline to generate quantified features from the raw data (e.g., gene-level counts for transcriptomics data quantified from raw RNA-seq reads). In this repository we provide scripts with the initial analyses of these post-quantification data, which are exploratory in nature. These analyses were used for sanity checks, QA procedures, and identifying flagged samples such as extreme PCA outliers.
 
